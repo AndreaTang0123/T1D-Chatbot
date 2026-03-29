@@ -1,16 +1,51 @@
+"""Pump data manager for Nightscout treatment/profile sync.
+
+This module is designed to be imported by the main server and run as a background
+async task, similar to a CGM manager. It can:
+1. load per-client pump config from `data/<client_id>/config.json`
+2. fetch new Nightscout treatments and profile data
+3. normalize and persist pump events to CSV/JSON
+4. generate short text summaries for downstream prompt/context assembly
+"""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import os
+import csv
+import json
+import time
+import asyncio
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Union, Optional
 from collections import Counter
+
 import requests
 import pytz
-import json
 
-BASE_URL = "https://night--nightscout--bfbsr6d8dlk9.code.run"
-API_SECRET_SHA1 = "893c9b0d94d5b20431cb5b786216cd096d3813f5"
-
+TAG = "pump_manager"
 EASTERN_TZ = pytz.timezone("US/Eastern")
+
+
+class SimpleLogger:
+    def info(self, msg: str) -> None:
+        print(f"[INFO] {msg}")
+
+    def warning(self, msg: str) -> None:
+        print(f"[WARNING] {msg}")
+
+    def error(self, msg: str) -> None:
+        print(f"[ERROR] {msg}")
+
+
+logger = SimpleLogger()
+
+
+def create_pump_background_task(data_root: str = "data"):
+    """Return the coroutine for the server to schedule.
+
+    Example integration in an async server startup:
+        asyncio.create_task(create_pump_background_task("data"))
+    """
+    return pump_background_task(data_root=data_root)
 
 
 def to_utc_ms(value: Union[str, datetime]) -> int:
@@ -40,240 +75,433 @@ def parse_iso_to_dt(value: str) -> datetime:
     return dt
 
 
-def fetch_treatments(
-    start: Union[str, datetime],
-    end: Union[str, datetime],
-    *,
-    base_url: str,
-    api_secret_sha1: str,
-    page_size: int = 500,
-    timeout: int = 20,
-) -> List[Dict[str, Any]]:
-    start_ms = to_utc_ms(start)
-    end_ms = to_utc_ms(end)
+class PumpManager:
+    def __init__(self, data_root: str = "data"):
+        self.data_root = data_root
 
-    if end_ms < start_ms:
-        raise ValueError("end must be >= start")
+    def _get_client_config(self, client_id: str) -> Optional[Dict[str, Any]]:
+        config_path = os.path.join(self.data_root, client_id, "config.json")
+        if not os.path.exists(config_path):
+            return None
+        try:
+            with open(config_path, "r") as f:
+                payload = json.load(f)
+            return payload.get("pump")
+        except Exception as e:
+            logger.error(f"Failed to load pump config for {client_id}: {e}")
+            return None
 
-    headers = {"api-secret": api_secret_sha1}
-    url = f"{base_url.rstrip('/')}/api/v1/treatments.json"
+    def _client_dir(self, client_id: str) -> str:
+        return os.path.join(self.data_root, client_id)
 
-    all_rows: List[Dict[str, Any]] = []
-    last_ms = start_ms - 1
+    def _events_csv_path(self, client_id: str) -> str:
+        return os.path.join(self._client_dir(client_id), "pump_events.csv")
 
-    while True:
-        params = {
-            "count": page_size,
-            "find[created_at][$gt]": datetime.fromtimestamp(last_ms / 1000, tz=timezone.utc).isoformat(),
-            "find[created_at][$lte]": datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).isoformat(),
+    def _profile_json_path(self, client_id: str) -> str:
+        return os.path.join(self._client_dir(client_id), "pump_profile.json")
+
+    def _get_last_event_time_ms(self, client_id: str) -> int:
+        csv_path = self._events_csv_path(client_id)
+        if not os.path.exists(csv_path):
+            return 0
+
+        try:
+            with open(csv_path, "r", newline="") as f:
+                lines = f.readlines()
+            if len(lines) <= 1:
+                return 0
+
+            header = lines[0].strip().split(",")
+            if "unix_s" not in header:
+                return 0
+            idx = header.index("unix_s")
+
+            for line in reversed(lines[1:]):
+                parts = line.strip().split(",")
+                if len(parts) <= idx:
+                    continue
+                try:
+                    return int(parts[idx]) * 1000
+                except ValueError:
+                    continue
+            return 0
+        except Exception as e:
+            logger.warning(f"Failed to read last pump event time for {client_id}: {e}")
+            return 0
+
+    def fetch_treatments(
+        self,
+        start: Union[str, datetime],
+        end: Union[str, datetime],
+        *,
+        base_url: str,
+        api_secret_sha1: str,
+        page_size: int = 500,
+        timeout: int = 20,
+    ) -> List[Dict[str, Any]]:
+        start_ms = to_utc_ms(start)
+        end_ms = to_utc_ms(end)
+
+        if end_ms < start_ms:
+            raise ValueError("end must be >= start")
+
+        headers = {"api-secret": api_secret_sha1}
+        url = f"{base_url.rstrip('/')}/api/v1/treatments.json"
+
+        all_rows: List[Dict[str, Any]] = []
+        last_ms = start_ms - 1
+
+        while True:
+            params = {
+                "count": page_size,
+                "find[created_at][$gt]": datetime.fromtimestamp(last_ms / 1000, tz=timezone.utc).isoformat(),
+                "find[created_at][$lte]": datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).isoformat(),
+            }
+
+            r = requests.get(url, params=params, headers=headers, timeout=timeout)
+            if not r.ok:
+                raise RuntimeError(f"Nightscout error {r.status_code}: {r.text[:300]}")
+
+            batch = r.json()
+            if not isinstance(batch, list):
+                raise RuntimeError(f"Unexpected response type: {type(batch)}")
+
+            if not batch:
+                break
+
+            batch.sort(key=lambda x: parse_iso_to_dt(x["created_at"]).timestamp() if "created_at" in x else 0)
+
+            for row in batch:
+                created_at = row.get("created_at")
+                if not isinstance(created_at, str):
+                    continue
+                ms = int(parse_iso_to_dt(created_at).astimezone(timezone.utc).timestamp() * 1000)
+                if start_ms <= ms <= end_ms:
+                    all_rows.append(row)
+
+            last_created_at = batch[-1].get("created_at")
+            if not isinstance(last_created_at, str):
+                break
+
+            new_last_ms = int(parse_iso_to_dt(last_created_at).astimezone(timezone.utc).timestamp() * 1000)
+
+            if new_last_ms <= last_ms:
+                break
+
+            last_ms = new_last_ms
+
+            if last_ms >= end_ms:
+                break
+
+        seen = set()
+        deduped: List[Dict[str, Any]] = []
+        for row in sorted(all_rows, key=lambda x: x.get("created_at", "")):
+            key = row.get("_id") or (
+                row.get("created_at"),
+                row.get("eventType"),
+                row.get("pump_event_id"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(row)
+
+        return deduped
+
+    def fetch_profile(self, *, base_url: str, api_secret_sha1: str, timeout: int = 20) -> Any:
+        headers = {"api-secret": api_secret_sha1}
+        url = f"{base_url.rstrip('/')}/api/v1/profile.json"
+
+        r = requests.get(url, headers=headers, timeout=timeout)
+        if not r.ok:
+            raise RuntimeError(f"Nightscout profile error {r.status_code}: {r.text[:300]}")
+        return r.json()
+
+    def extract_active_profile(self, profile_payload: Any) -> Dict[str, Any]:
+        if not isinstance(profile_payload, list) or not profile_payload:
+            return {}
+
+        first = profile_payload[0]
+        if not isinstance(first, dict):
+            return {}
+
+        default_profile_name = first.get("defaultProfile")
+        store = first.get("store", {})
+
+        if not isinstance(store, dict):
+            return {}
+
+        if isinstance(default_profile_name, str) and default_profile_name in store:
+            active_name = default_profile_name
+        else:
+            active_name = next(iter(store.keys()), None)
+
+        if active_name is None:
+            return {}
+
+        profile = store.get(active_name, {})
+        if not isinstance(profile, dict):
+            return {}
+
+        return {
+            "active_profile_name": active_name,
+            "timezone": profile.get("timezone"),
+            "units": profile.get("units"),
+            "dia_hours": profile.get("dia"),
+            "basal_schedule": profile.get("basal", []),
+            "carbratio_schedule": profile.get("carbratio", []),
+            "sensitivity_schedule": profile.get("sens", []),
+            "target_low_schedule": profile.get("target_low", []),
+            "target_high_schedule": profile.get("target_high", []),
+            "raw_profile": profile,
         }
 
-        r = requests.get(url, params=params, headers=headers, timeout=timeout)
-        if not r.ok:
-            raise RuntimeError(f"Nightscout error {r.status_code}: {r.text[:300]}")
+    def _normalize_event(self, row: Dict[str, Any], tz=pytz.timezone("US/Eastern")) -> Optional[Dict[str, Any]]:
+        created_at = row.get("created_at")
+        if not isinstance(created_at, str):
+            return None
 
-        batch = r.json()
-        if not isinstance(batch, list):
-            raise RuntimeError(f"Unexpected response type: {type(batch)}")
+        dt_utc = parse_iso_to_dt(created_at).astimezone(timezone.utc)
+        dt_local = dt_utc.astimezone(tz)
+        event_type = row.get("eventType", "UNKNOWN")
 
-        if not batch:
-            break
+        if event_type == "Temp Basal":
+            category = "temp_basal"
+        elif "Bolus" in str(event_type):
+            category = "bolus"
+        else:
+            category = "other"
 
-        batch.sort(key=lambda x: parse_iso_to_dt(x["created_at"]).timestamp() if "created_at" in x else 0)
+        return {
+            "time": created_at,
+            "time_et": dt_local.isoformat(),
+            "unix_s": int(dt_utc.timestamp()),
+            "hour": dt_local.hour,
+            "weekday": dt_local.weekday(),
+            "event_type": event_type,
+            "category": category,
+            "entered_by": row.get("enteredBy"),
+            "pump_event_id": row.get("pump_event_id"),
+            "insulin_units": row.get("insulin"),
+            "carbs_g": row.get("carbs"),
+            "glucose_mgdl": row.get("glucose"),
+            "rate_u_per_hr": row.get("absolute") if row.get("absolute") is not None else row.get("rate"),
+            "duration_min": row.get("duration"),
+            "reason": row.get("reason"),
+            "notes": row.get("notes"),
+            "raw_json": json.dumps(row, ensure_ascii=False),
+        }
 
-        for row in batch:
-            created_at = row.get("created_at")
-            if not isinstance(created_at, str):
-                continue
-            ms = int(parse_iso_to_dt(created_at).astimezone(timezone.utc).timestamp() * 1000)
-            if start_ms <= ms <= end_ms:
-                all_rows.append(row)
+    def _append_to_csv(self, rows: List[Dict[str, Any]], filename: str) -> None:
+        if not rows:
+            return
 
-        new_last_ms = int(parse_iso_to_dt(batch[-1]["created_at"]).astimezone(timezone.utc).timestamp() * 1000)
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        file_exists = os.path.isfile(filename)
 
-        if new_last_ms <= last_ms:
-            break
+        with open(filename, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            if not file_exists:
+                writer.writeheader()
+            writer.writerows(rows)
 
-        last_ms = new_last_ms
+    def _write_profile_json(self, client_id: str, payload: Dict[str, Any]) -> None:
+        path = self._profile_json_path(client_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
 
-        if last_ms >= end_ms:
-            break
+    def fetch_and_update(self, client_id: str) -> None:
+        pump_config = self._get_client_config(client_id)
+        if not pump_config:
+            return
 
-    seen = set()
-    deduped: List[Dict[str, Any]] = []
-    for row in sorted(all_rows, key=lambda x: x.get("created_at", "")):
-        key = row.get("_id") or (
-            row.get("created_at"),
-            row.get("eventType"),
-            row.get("pump_event_id"),
+        base_url = pump_config.get("base_url")
+        api_secret = pump_config.get("api_secret")
+        user_tz_str = pump_config.get("user_tz", "US/Eastern")
+
+        if not base_url or not api_secret:
+            return
+
+        try:
+            tz = pytz.timezone(user_tz_str)
+        except Exception:
+            tz = EASTERN_TZ
+
+        last_ms = self._get_last_event_time_ms(client_id)
+        if last_ms == 0:
+            start = datetime.now(timezone.utc) - timedelta(days=1)
+        else:
+            start = datetime.fromtimestamp((last_ms + 1000) / 1000, tz=timezone.utc)
+        end = datetime.now(timezone.utc)
+
+        try:
+            treatments = self.fetch_treatments(
+                start,
+                end,
+                base_url=base_url,
+                api_secret_sha1=api_secret,
+            )
+            profile_payload = self.fetch_profile(
+                base_url=base_url,
+                api_secret_sha1=api_secret,
+            )
+        except Exception as e:
+            logger.error(f"Pump fetch failed for {client_id}: {e}")
+            return
+
+        pump_rows = [x for x in treatments if x.get("enteredBy") == "Pump (tconnectsync)"]
+        normalized_rows = []
+        for row in pump_rows:
+            normalized = self._normalize_event(row, tz=tz)
+            if normalized is not None:
+                normalized_rows.append(normalized)
+
+        normalized_rows.sort(key=lambda x: x["unix_s"])
+        self._append_to_csv(normalized_rows, self._events_csv_path(client_id))
+
+        active_profile = self.extract_active_profile(profile_payload)
+        profile_output = {
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "active_profile": active_profile,
+            "raw_profile_payload": profile_payload,
+        }
+        self._write_profile_json(client_id, profile_output)
+
+        logger.info(
+            f"Fetched {len(normalized_rows)} new pump events for {client_id}; "
+            f"profile saved to {self._profile_json_path(client_id)}"
         )
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(row)
 
-    return deduped
+    def get_latest_event(self, client_id: str) -> Optional[Dict[str, Any]]:
+        csv_path = self._events_csv_path(client_id)
+        if not os.path.exists(csv_path):
+            return None
+
+        try:
+            with open(csv_path, "r") as f:
+                header_line = f.readline()
+                if not header_line:
+                    return None
+                header = header_line.strip().split(",")
+
+                f.seek(0, os.SEEK_END)
+                file_size = f.tell()
+                seek_pos = max(0, file_size - 4096)
+                f.seek(seek_pos)
+
+                content = f.read()
+                lines = content.splitlines()
+                if seek_pos > 0 and lines:
+                    lines.pop(0)
+                if not lines:
+                    return None
+
+                last_row_str = lines[-1]
+                parts = last_row_str.split(",")
+                if len(parts) != len(header) and len(lines) > 1:
+                    last_row_str = lines[-2]
+                    parts = last_row_str.split(",")
+                if len(parts) != len(header):
+                    return None
+
+                return dict(zip(header, parts))
+        except Exception as e:
+            logger.error(f"Failed to get latest pump event for {client_id}: {e}")
+            return None
+
+    def get_realtime_status(self, client_id: str) -> str:
+        latest = self.get_latest_event(client_id)
+        if not latest:
+            return ""
+
+        try:
+            now_ts = int(time.time())
+            event_ts = int(latest.get("unix_s", 0))
+            diff_min = (now_ts - event_ts) // 60
+            event_type = latest.get("event_type", "UNKNOWN")
+            category = latest.get("category", "other")
+
+            if category == "temp_basal":
+                rate = latest.get("rate_u_per_hr") or "?"
+                duration = latest.get("duration_min") or "?"
+                return f"Latest Pump Event: Temp Basal {rate} U/hr for {duration} min, {diff_min} mins ago."
+
+            if category == "bolus":
+                insulin = latest.get("insulin_units") or "?"
+                carbs = latest.get("carbs_g") or "?"
+                return f"Latest Pump Event: {event_type} with {insulin} U and {carbs} g carbs, {diff_min} mins ago."
+
+            return f"Latest Pump Event: {event_type}, {diff_min} mins ago."
+        except Exception:
+            return ""
+
+    def analyze_recent_patterns(self, client_id: str, days: int = 14) -> List[str]:
+        csv_path = self._events_csv_path(client_id)
+        if not os.path.exists(csv_path):
+            return []
+
+        try:
+            with open(csv_path, "r") as f:
+                rows = list(csv.DictReader(f))
+            if not rows:
+                return []
+
+            cutoff_ts = int(time.time()) - days * 86400
+            recent_rows = [r for r in rows if int(r.get("unix_s", 0)) >= cutoff_ts]
+            if not recent_rows:
+                return []
+
+            counts = Counter(r.get("event_type", "UNKNOWN") for r in recent_rows)
+            trends = []
+
+            if counts:
+                top_name, top_count = counts.most_common(1)[0]
+                trends.append(f"Pump Pattern: Most frequent recent event is {top_name} ({top_count} times in last {days} days).")
+
+            hourly_bolus = Counter(int(r.get("hour", 0)) for r in recent_rows if r.get("category") == "bolus")
+            if hourly_bolus:
+                top_hour, top_hour_count = hourly_bolus.most_common(1)[0]
+                trends.append(f"Pump Pattern: Bolus events most often happen around hour {top_hour:02d}:00 ({top_hour_count} times).")
+
+            return trends
+        except Exception:
+            return []
+
+    def get_context_summary(self, client_id: str) -> str:
+        status = self.get_realtime_status(client_id)
+        if not status:
+            return ""
+
+        patterns = self.analyze_recent_patterns(client_id)
+        pattern_str = " ".join(patterns)
+        return f"[Pump Data]\n{status}\n{pattern_str}"
 
 
-def fetch_profile(*, base_url: str, api_secret_sha1: str, timeout: int = 20) -> Any:
-    headers = {"api-secret": api_secret_sha1}
-    url = f"{base_url.rstrip('/')}/api/v1/profile.json"
-
-    r = requests.get(url, headers=headers, timeout=timeout)
-    if not r.ok:
-        raise RuntimeError(f"Nightscout profile error {r.status_code}: {r.text[:300]}")
-    return r.json()
+    def has_pump_config(self, client_id: str) -> bool:
+        pump_config = self._get_client_config(client_id)
+        return bool(pump_config and pump_config.get("base_url") and pump_config.get("api_secret"))
 
 
-def normalize_basal(row: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "type": "temp_basal",
-        "time": row.get("created_at"),
-        "time_et": parse_iso_to_dt(row["created_at"]).astimezone(EASTERN_TZ).isoformat() if row.get("created_at") else None,
-        "rate_u_per_hr": row.get("absolute") if row.get("absolute") is not None else row.get("rate"),
-        "duration_min": row.get("duration"),
-        "reason": row.get("reason"),
-        "pump_event_id": row.get("pump_event_id"),
-        "entered_by": row.get("enteredBy"),
-    }
+async def pump_background_task(data_root: str = "data") -> None:
+    logger.info("Pump scraper task started.")
+    manager = PumpManager(data_root=data_root)
 
-
-def normalize_bolus(row: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "type": "bolus",
-        "subtype": row.get("eventType"),
-        "time": row.get("created_at"),
-        "time_et": parse_iso_to_dt(row["created_at"]).astimezone(EASTERN_TZ).isoformat() if row.get("created_at") else None,
-        "insulin_units": row.get("insulin"),
-        "carbs_g": row.get("carbs"),
-        "glucose_mgdl": row.get("glucose"),
-        "notes": row.get("notes"),
-        "pump_event_id": row.get("pump_event_id"),
-        "entered_by": row.get("enteredBy"),
-    }
-
-
-def normalize_pump_event(row: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "type": "pump_event",
-        "subtype": row.get("eventType"),
-        "time": row.get("created_at"),
-        "time_et": parse_iso_to_dt(row["created_at"]).astimezone(EASTERN_TZ).isoformat() if row.get("created_at") else None,
-        "entered_by": row.get("enteredBy"),
-        "pump_event_id": row.get("pump_event_id"),
-        "raw": row,
-    }
-
-
-def extract_active_profile(profile_payload: Any) -> Dict[str, Any]:
-    """
-    Returns a simplified active profile object from Nightscout profile.json.
-    Prefers the first profile object's defaultProfile.
-    """
-    if not isinstance(profile_payload, list) or not profile_payload:
-        return {}
-
-    first = profile_payload[0]
-    if not isinstance(first, dict):
-        return {}
-
-    default_profile_name = first.get("defaultProfile")
-    store = first.get("store", {})
-
-    if not isinstance(store, dict):
-        return {}
-
-    # prefer defaultProfile if present
-    if isinstance(default_profile_name, str) and default_profile_name in store:
-        active_name = default_profile_name
-    else:
-        active_name = next(iter(store.keys()), None)
-
-    if active_name is None:
-        return {}
-
-    profile = store.get(active_name, {})
-    if not isinstance(profile, dict):
-        return {}
-
-    return {
-        "active_profile_name": active_name,
-        "timezone": profile.get("timezone"),
-        "units": profile.get("units"),
-        "dia_hours": profile.get("dia"),
-        "basal_schedule": profile.get("basal", []),
-        "carbratio_schedule": profile.get("carbratio", []),
-        "sensitivity_schedule": profile.get("sens", []),
-        "target_low_schedule": profile.get("target_low", []),
-        "target_high_schedule": profile.get("target_high", []),
-        "raw_profile": profile,
-    }
-
-
-def fetch_pump_data(
-    start: Union[str, datetime],
-    end: Union[str, datetime],
-    *,
-    base_url: str,
-    api_secret_sha1: str,
-) -> Dict[str, Any]:
-    treatments = fetch_treatments(
-        start,
-        end,
-        base_url=base_url,
-        api_secret_sha1=api_secret_sha1,
-    )
-    profile_payload = fetch_profile(
-        base_url=base_url,
-        api_secret_sha1=api_secret_sha1,
-    )
-
-    pump_rows = [x for x in treatments if x.get("enteredBy") == "Pump (tconnectsync)"]
-
-    basal_rows = [x for x in pump_rows if x.get("eventType") == "Temp Basal"]
-    bolus_rows = [x for x in pump_rows if "Bolus" in str(x.get("eventType"))]
-    other_rows = [
-        x for x in pump_rows
-        if x.get("eventType") != "Temp Basal" and "Bolus" not in str(x.get("eventType"))
-    ]
-
-    normalized = {
-        "summary": {
-            "start": start if isinstance(start, str) else start.isoformat(),
-            "end": end if isinstance(end, str) else end.isoformat(),
-            "total_treatments": len(treatments),
-            "pump_treatments": len(pump_rows),
-            "event_type_counts": dict(Counter(x.get("eventType", "UNKNOWN") for x in pump_rows)),
-            "basal_count": len(basal_rows),
-            "bolus_count": len(bolus_rows),
-            "other_event_count": len(other_rows),
-        },
-        "basal_events": [normalize_basal(x) for x in basal_rows],
-        "bolus_events": [normalize_bolus(x) for x in bolus_rows],
-        "other_pump_events": [normalize_pump_event(x) for x in other_rows],
-        "active_profile": extract_active_profile(profile_payload),
-        "raw_profile_payload": profile_payload,
-    }
-
-    return normalized
+    while True:
+        try:
+            if os.path.exists(data_root):
+                for client_id in os.listdir(data_root):
+                    client_path = os.path.join(data_root, client_id)
+                    if os.path.isdir(client_path) and manager.has_pump_config(client_id):
+                        manager.fetch_and_update(client_id)
+            await asyncio.sleep(900)
+        except Exception as e:
+            logger.error(f"Pump background task error: {e}")
+            await asyncio.sleep(60)
 
 
 if __name__ == "__main__":
-    pump_data = fetch_pump_data(
-        "2026-03-09T00:00:00Z",
-        "2026-03-09T23:59:59Z",
-        base_url=BASE_URL,
-        api_secret_sha1=API_SECRET_SHA1,
-    )
-
-    print("=== summary ===")
-    print(json.dumps(pump_data["summary"], indent=2))
-
-    print("\n=== first 3 basal events ===")
-    print(json.dumps(pump_data["basal_events"][:3], indent=2))
-
-    print("\n=== bolus events ===")
-    print(json.dumps(pump_data["bolus_events"], indent=2))
-
-    print("\n=== active profile ===")
-    print(json.dumps(pump_data["active_profile"], indent=2)[:4000])
+    manager = PumpManager(data_root="data")
+    demo_client = "demo_client"
+    print("Pump manager module loaded.")
+    print(manager.get_context_summary(demo_client))
