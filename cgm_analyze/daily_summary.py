@@ -7,7 +7,7 @@ from typing import Any, Dict, List
 import numpy as np
 import pandas as pd
 
-from fetch_cgm import API_SECRET_SHA1, BASE_URL, EASTERN_TZ, fetch_cgm
+from fetch.fetch_cgm import API_SECRET_SHA1, BASE_URL, EASTERN_TZ, fetch_cgm
 
 
 # -----------------------------
