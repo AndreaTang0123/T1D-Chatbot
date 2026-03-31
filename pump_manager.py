@@ -607,78 +607,78 @@ class PumpManager:
         pump_config = self._get_client_config(client_id)
         return bool(pump_config and pump_config.get("base_url") and pump_config.get("api_secret"))
 
-def analyze_insulin_effectiveness(self, client_id: str) -> List[str]:
-    pump_rows = self._read_all_events(client_id)
-    cgm_path = os.path.join(self._client_dir(client_id), "cgm.csv")
+    def analyze_insulin_effectiveness(self, client_id: str) -> List[str]:
+        pump_rows = self._read_all_events(client_id)
+        cgm_path = os.path.join(self._client_dir(client_id), "cgm.csv")
 
-    if not os.path.exists(cgm_path):
-        return []
+        if not os.path.exists(cgm_path):
+            return []
 
-    with open(cgm_path, "r") as f:
-        cgm_rows = list(csv.DictReader(f))
+        with open(cgm_path, "r") as f:
+            cgm_rows = list(csv.DictReader(f))
 
-    if not pump_rows or not cgm_rows:
-        return []
+        if not pump_rows or not cgm_rows:
+            return []
 
-    results = []
+        results = []
 
-    for row in pump_rows[-10:]:  # 看最近10次
-        if row.get("category") != "bolus":
-            continue
+        for row in pump_rows[-10:]:  # 看最近10次
+            if row.get("category") != "bolus":
+                continue
 
-        ts = int(float(row["unix_s"]))
+            ts = int(float(row["unix_s"]))
 
-        before = [
-            float(r["sgv"])
-            for r in cgm_rows
-            if ts - 1800 <= int(r["unix_s"]) <= ts
+            before = [
+                float(r["sgv"])
+                for r in cgm_rows
+                if ts - 1800 <= int(r["unix_s"]) <= ts
+            ]
+
+            after = [
+                float(r["sgv"])
+                for r in cgm_rows
+                if ts + 3600 <= int(r["unix_s"]) <= ts + 4*3600
+            ]
+
+            if not before or not after:
+                continue
+
+            delta = sum(after)/len(after) - sum(before)/len(before)
+            results.append(delta)
+
+        if not results:
+            return []
+
+        avg_delta = sum(results)/len(results)
+
+        direction = "decreased" if avg_delta < 0 else "increased"
+
+        return [
+            f"After recent boluses, glucose {direction} by {abs(avg_delta):.1f} mg/dL on average"
         ]
 
-        after = [
-            float(r["sgv"])
-            for r in cgm_rows
-            if ts + 3600 <= int(r["unix_s"]) <= ts + 4*3600
+    def detect_pump_anomalies(self, client_id: str) -> List[str]:
+        rows = self._read_all_events(client_id)
+        if not rows:
+            return []
+
+        recent = rows[-100:]
+        bolus_count = sum(1 for r in recent if r.get("category") == "bolus")
+
+        insights = []
+
+        if bolus_count > 20:
+            insights.append("High frequency of bolus events detected recently")
+
+        overnight_temp = [
+            r for r in recent
+            if r.get("category") == "temp_basal" and int(r.get("hour", 0)) < 6
         ]
 
-        if not before or not after:
-            continue
+        if len(overnight_temp) > 5:
+            insights.append("Frequent overnight temp basal usage")
 
-        delta = sum(after)/len(after) - sum(before)/len(before)
-        results.append(delta)
-
-    if not results:
-        return []
-
-    avg_delta = sum(results)/len(results)
-
-    direction = "decreased" if avg_delta < 0 else "increased"
-
-    return [
-        f"After recent boluses, glucose {direction} by {abs(avg_delta):.1f} mg/dL on average"
-    ]
-
-def detect_pump_anomalies(self, client_id: str) -> List[str]:
-    rows = self._read_all_events(client_id)
-    if not rows:
-        return []
-
-    recent = rows[-100:]
-    bolus_count = sum(1 for r in recent if r.get("category") == "bolus")
-
-    insights = []
-
-    if bolus_count > 20:
-        insights.append("High frequency of bolus events detected recently")
-
-    overnight_temp = [
-        r for r in recent
-        if r.get("category") == "temp_basal" and int(r.get("hour", 0)) < 6
-    ]
-
-    if len(overnight_temp) > 5:
-        insights.append("Frequent overnight temp basal usage")
-
-    return insights
+        return insights
 
 async def pump_background_task(data_root: str = "data") -> None:
     logger.info("Pump scraper task started.")
