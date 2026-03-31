@@ -237,6 +237,19 @@ class CGMManager:
         except Exception as e:
             return ""
 
+    def _read_all_rows(self, client_id: str) -> List[Dict[str, Any]]:
+        csv_path = os.path.join("data", client_id, "cgm.csv")
+        if not os.path.exists(csv_path):
+            return []
+
+        try:
+            with open(csv_path, "r") as f:
+                return list(csv.DictReader(f))
+        except Exception as e:
+            logger.bind(tag=TAG).error(f"Failed to read CGM rows: {e}")
+            return []
+    
+
     def analyze_daily_trends(self, client_id: str, days=14) -> List[str]:
         """Analyze last N days for hourly patterns"""
         # Load data (should optimize to not load all)
@@ -284,6 +297,35 @@ class CGMManager:
     def analyze_weekly_trends(self, client_id: str, weeks=4) -> List[str]:
          # Similar logic for weekday (0-6)
          return []
+    
+    def analyze_long_term_control(self, client_id: str, days: int = 14) -> List[str]:
+        rows = self._read_all_rows(client_id)
+        if not rows:
+            return []
+
+        cutoff_ts = int(time.time()) - days * 86400
+        recent = [
+            r for r in rows 
+            if r.get("unix_s") and int(r["unix_s"]) >= cutoff_ts
+        ]
+
+        values = [float(r["sgv"]) for r in recent if r.get("sgv")]
+        if not values:
+            return []
+
+        total = len(values)
+        mean_glucose = sum(values) / total
+
+        tir = sum(70 <= v <= 180 for v in values) / total * 100
+        tar = sum(v > 180 for v in values) / total * 100
+        tbr = sum(v < 70 for v in values) / total * 100
+
+        gmi = 3.31 + 0.02392 * mean_glucose
+
+        return [
+            f"TIR {tir:.1f}%, TAR {tar:.1f}%, TBR {tbr:.1f}%",
+            f"Mean glucose {mean_glucose:.1f} mg/dL, GMI {gmi:.2f}%"
+        ]
 
     def get_context_summary(self, client_id: str) -> str:
         """Full context block for LLM"""
@@ -292,8 +334,13 @@ class CGMManager:
         
         daily = self.analyze_daily_trends(client_id)
         daily_str = " ".join(daily)
+
+        long_term = self.analyze_long_term_control(client_id)
+        daily_str += " " + " ".join(long_term)
         
         return f"[CGM Data]\n{status}\n{daily_str}"
+    
+
 
 async def cgm_background_task():
     """Periodic update task"""
