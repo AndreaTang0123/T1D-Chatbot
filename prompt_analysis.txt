@@ -50,7 +50,7 @@ Bad:
 
 Good:
 - "Your control has been a bit variable"
-- "Your glucose has been fluctuating more than usual"
+- "Your glucose has been fluctuating more than usual" 
 
 ==================================================
 CAUSAL LANGUAGE

@@ -1,10 +1,13 @@
 """
-System prompt manager module
-Responsible for managing and updating system prompts, including quick initialization and async enhancement functions
+System prompt manager module.
+
+This manager now supports both:
+1. A legacy single prompt file (`prompt.txt`) for backward compatibility.
+2. A layered prompt pipeline made of separate persona / decision / interpretation prompts.
 """
 
 import os
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from config.logger import setup_logging
 from config.config_loader import get_project_dir
 from jinja2 import Template
@@ -45,6 +48,12 @@ class PromptManager:
         self.base_prompt_template = None
         self.last_update_time = 0
 
+        self.prompt_paths = {
+            "persona": self.config.get("persona_prompt_template", "data/agent-base-prompt.txt"),
+            "decision": self.config.get("decision_prompt_template", "data/prompts/prompt_decision.txt"),
+            "interpretation": self.config.get("interpretation_prompt_template", "data/prompts/prompt_analysis.txt"),
+        }
+
         # Import global cache manager
         from core.utils.cache.manager import cache_manager, CacheType
 
@@ -59,39 +68,105 @@ class PromptManager:
         self._load_base_template()
 
     def _load_base_template(self):
-        """Load base prompt template"""
+        """Load base prompt template."""
         try:
             template_path = self.config.get("prompt_template", "data/agent-base-prompt.txt")
-            if not os.path.isabs(template_path):
-                template_path = os.path.join(get_project_dir(), template_path)
-            cache_key = f"prompt_template:{template_path}"
-
-            # Try cache first
-            cached_template = self.cache_manager.get(self.CacheType.CONFIG, cache_key)
-            if cached_template is not None:
-                self.base_prompt_template = cached_template
-                self.logger.bind(tag=TAG).debug("Load base prompt template from cache")
-                return
-
-            # Cache miss, read from file
-            if os.path.exists(template_path):
-                with open(template_path, "r", encoding="utf-8") as f:
-                    template_content = f.read()
-
-                # Save to cache (CONFIG type does not expire automatically, needs manual invalidation)
-                self.cache_manager.set(
-                    self.CacheType.CONFIG, cache_key, template_content
-                )
-                self.base_prompt_template = template_content
-                self.logger.bind(tag=TAG).debug("Successfully loaded base prompt template and cached")
-            else:
-                self.logger.bind(tag=TAG).warning(f"File {template_path} not found")
+            self.base_prompt_template = self._load_prompt_file(template_path)
+            if self.base_prompt_template:
+                self.logger.bind(tag=TAG).debug("Successfully loaded base prompt template")
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"Failed to load prompt template: {e}")
 
+    def _resolve_prompt_path(self, template_path: str) -> str:
+        """Resolve prompt path relative to project root when needed."""
+        if not os.path.isabs(template_path):
+            template_path = os.path.join(get_project_dir(), template_path)
+        return template_path
+
+    def _load_prompt_file(self, template_path: str) -> str:
+        """Load an arbitrary prompt file with config cache support."""
+        try:
+            resolved_path = self._resolve_prompt_path(template_path)
+            cache_key = f"prompt_template:{resolved_path}"
+
+            cached_template = self.cache_manager.get(self.CacheType.CONFIG, cache_key)
+            if cached_template is not None:
+                return cached_template
+
+            if not os.path.exists(resolved_path):
+                self.logger.bind(tag=TAG).warning(f"Prompt file {resolved_path} not found")
+                return ""
+
+            with open(resolved_path, "r", encoding="utf-8") as f:
+                template_content = f.read()
+
+            self.cache_manager.set(self.CacheType.CONFIG, cache_key, template_content)
+            return template_content
+        except Exception as e:
+            self.logger.bind(tag=TAG).error(f"Failed to load prompt file {template_path}: {e}")
+            return ""
+
+    def _read_client_prompt_file(self, prompt_name: str, client_id: Optional[str] = None, device_id: Optional[str] = None) -> str:
+        """Read a prompt override from data/{id}/{prompt_name}."""
+        target_ids = []
+        if client_id:
+            target_ids.append(client_id)
+        if device_id:
+            target_ids.append(device_id)
+
+        for tid in target_ids:
+            prompt_file = os.path.join("data", tid, prompt_name)
+            if os.path.exists(prompt_file):
+                try:
+                    with open(prompt_file, "r", encoding="utf-8") as f:
+                        content = f.read().strip()
+                        if content:
+                            self.logger.bind(tag=TAG).info(f"Loaded prompt override from {prompt_file}")
+                            return content
+                except Exception as e:
+                    self.logger.bind(tag=TAG).error(f"Failed to load prompt file {prompt_file}: {e}")
+        return ""
+
+    def get_layer_prompt(self, layer: str, client_id: str = None, device_id: str = None) -> str:
+        """Get a prompt for one pipeline layer.
+
+        Priority:
+        1. data/{client_id}/{layer_name}.txt or data/{device_id}/{layer_name}.txt
+        2. configured project-level prompt file
+        """
+        layer_to_filename = {
+            "persona": "prompt_persona.txt",
+            "decision": "prompt_decision.txt",
+            "interpretation": "prompt_analysis.txt",
+        }
+
+        if layer not in layer_to_filename:
+            raise ValueError(f"Unsupported prompt layer: {layer}")
+
+        override_content = self._read_client_prompt_file(
+            layer_to_filename[layer],
+            client_id=client_id,
+            device_id=device_id,
+        )
+        if override_content:
+            return override_content
+
+        template_path = self.prompt_paths.get(layer, "")
+        return self._load_prompt_file(template_path)
+
+    def get_pipeline_prompts(self, client_id: str = None, device_id: str = None) -> Dict[str, str]:
+        """Return layered prompts for the persona / decision / interpretation pipeline."""
+        return {
+            "persona": self.get_layer_prompt("persona", client_id=client_id, device_id=device_id),
+            "decision": self.get_layer_prompt("decision", client_id=client_id, device_id=device_id),
+            "interpretation": self.get_layer_prompt("interpretation", client_id=client_id, device_id=device_id),
+        }
+
     def get_quick_prompt(self, user_prompt: str, device_id: str = None, client_id: str = None) -> str:
         """Quickly get system prompt (use user config or device-specific override)"""
-        
+        # Legacy path: this method returns a single prompt string.
+        # New layered-prompt callers should use `get_pipeline_prompts(...)` instead.
+
         # 1. Check for file-based override: data/{client_id}/prompt.txt
         # Check client_id first (more specific session), then device_id (hardware)
         target_ids = []

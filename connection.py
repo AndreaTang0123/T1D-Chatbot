@@ -21,7 +21,7 @@ from core.utils.util import (
     check_asr_update,
     filter_sensitive_info,
 )
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from collections import deque
 from core.utils.modules_initialize import (
     initialize_modules,
@@ -90,6 +90,7 @@ class ConnectionHandler:
         self.device_id = None
         self.client_ip = None
         self.prompt = None
+        self.pipeline_prompts = {}
         self.welcome_msg = None
         self.max_output_size = 0
         self.chat_history_conf = 0
@@ -492,9 +493,18 @@ class ConnectionHandler:
             self.logger = create_connection_logger(self.selected_module_str)
 
             """Initialize components"""
-            if self.config.get("prompt") is not None:
+            prompt = None
+            self._load_pipeline_prompts()
+
+            persona_prompt = self.pipeline_prompts.get("persona") if self.pipeline_prompts else None
+            if persona_prompt:
+                prompt = persona_prompt
+                self.logger.bind(tag=TAG).info(
+                    f"Layered persona prompt loaded successfully {prompt[:50]}..."
+                )
+            elif self.config.get("prompt") is not None:
                 user_prompt = self.config["prompt"]
-                # Use quick prompt for initialization
+                # Legacy fallback: use quick prompt for initialization
                 client_id = self.headers.get("client-id")
                 prompt = self.prompt_manager.get_quick_prompt(user_prompt, self.device_id, client_id)
                 self.change_system_prompt(prompt)
@@ -538,10 +548,18 @@ class ConnectionHandler:
 
         # Update context info
         self.prompt_manager.update_context_info(self, self.client_ip)
-        
-        # Use provided current_prompt if available (e.g. from file override), otherwise use config default
-        base_prompt = current_prompt if current_prompt else self.config["prompt"]
-        
+
+        # Prefer persona prompt from the layered pipeline if available.
+        persona_prompt = None
+        if self.pipeline_prompts:
+            persona_prompt = self.pipeline_prompts.get("persona")
+
+        # Fallback order:
+        # 1. explicit current_prompt passed in
+        # 2. layered persona prompt
+        # 3. config default prompt
+        base_prompt = current_prompt if current_prompt else (persona_prompt or self.config["prompt"])
+
         client_id = self.headers.get("client-id") if self.headers else None
         enhanced_prompt = self.prompt_manager.build_enhanced_prompt(
             base_prompt, self.device_id, self.client_ip, client_id=client_id
@@ -549,6 +567,7 @@ class ConnectionHandler:
         if enhanced_prompt:
             self.change_system_prompt(enhanced_prompt)
             self.logger.bind(tag=TAG).debug("System prompt enhanced successfully")
+
 
     def _get_volume_level(self):
         """Unified method to get volume level from headers or MCP"""
@@ -610,24 +629,6 @@ class ConnectionHandler:
                     if self.mcp_battery and self.mcp_battery != "unknown":
                         return str(self.mcp_battery)
             except: pass
-        return "unknown"
-
-        # 5. Diagnostic Logging (only if we failed to find it)
-        if self.headers:
-            self.logger.bind(tag=TAG).info(f"Battery unknown. Available headers: {list(self.headers.keys())}")
-        
-        # Check MCP Status for diagnostics
-        mcp_ready = False
-        if hasattr(self, "mcp_client") and self.mcp_client:
-            mcp_ready = getattr(self.mcp_client, "ready", False)
-        self.logger.bind(tag=TAG).info(f"Battery unknown. MCP Ready: {mcp_ready}, MCP Cache: {self.mcp_battery}")
-
-        if self.iot_descriptors:
-            all_props = []
-            for d in self.iot_descriptors.values():
-                all_props.extend([p.get("name") for p in d.properties])
-            self.logger.bind(tag=TAG).info(f"Battery unknown. Available IoT properties: {all_props}")
-            
         return "unknown"
 
     def _init_report_threads(self):
@@ -962,12 +963,201 @@ class ConnectionHandler:
         # Update system prompt to context
         self.dialogue.update_system_message(self.prompt)
 
+    def _load_pipeline_prompts(self):
+        """Load persona / decision / interpretation prompts for the current client."""
+        try:
+            client_id = self.headers.get("client-id") if self.headers else None
+            self.pipeline_prompts = self.prompt_manager.get_pipeline_prompts(
+                client_id=client_id,
+                device_id=self.device_id,
+            )
+        except Exception as e:
+            self.logger.bind(tag=TAG).error(f"Failed to load pipeline prompts: {e}")
+            self.pipeline_prompts = {}
+
+    def _llm_single_shot(self, system_prompt: str, user_payload: Any) -> str:
+        """Run a one-shot LLM call without mutating the main dialogue history."""
+        if not self.llm:
+            return ""
+
+        try:
+            if isinstance(user_payload, str):
+                user_content = user_payload
+            else:
+                user_content = json.dumps(user_payload, ensure_ascii=False, indent=2)
+
+            temp_dialogue = Dialogue()
+            temp_dialogue.update_system_message(system_prompt)
+            temp_dialogue.put(Message(role="user", content=user_content))
+
+            memory_str = None
+            messages = temp_dialogue.get_llm_dialogue_with_memory(
+                memory_str, self.config.get("voiceprint", {})
+            )
+
+            chunks = []
+            temp_session_id = str(uuid.uuid4())
+            for chunk in self.llm.response(temp_session_id, messages):
+                if chunk:
+                    chunks.append(chunk)
+            return "".join(chunks).strip()
+        except Exception as e:
+            self.logger.bind(tag=TAG).error(f"Single-shot LLM call failed: {e}")
+            return ""
+
+    def _safe_parse_json(self, raw_text: str) -> Dict[str, Any]:
+        """Parse JSON response safely, with fallback extraction from free text."""
+        if not raw_text:
+            return {}
+
+        try:
+            return json.loads(raw_text)
+        except Exception:
+            pass
+
+        extracted = extract_json_from_string(raw_text)
+        if extracted:
+            try:
+                return json.loads(extracted)
+            except Exception:
+                pass
+
+        self.logger.bind(tag=TAG).warning(f"Failed to parse JSON response: {raw_text[:200]}")
+        return {}
+
+    def _build_pipeline_analysis_result(self, query: str, context_needs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Build structured analysis input for the decision / interpretation pipeline."""
+        result = {
+            "user_query": query,
+            "language_hint": getattr(self, "current_language_tag", None),
+            "intent_context": context_needs or {},
+            "glucose_now": None,
+            "cgm_metrics": {},
+            "events": {},
+            "patterns": {
+                "daily": [],
+                "weekly": [],
+                "monthly": [],
+            },
+            "pump_status": {},
+            "pump_patterns": {},
+            "pump_glucose_joint": {},
+            "anomalies": [],
+        }
+
+        client_id = self.headers.get("client-id") if self.headers else None
+        if not client_id:
+            return result
+
+        try:
+            config_path = os.path.join("data", client_id, "config.json")
+            client_cfg = {}
+            if os.path.exists(config_path):
+                with open(config_path, "r", encoding="utf-8") as f:
+                    client_cfg = json.load(f)
+
+            cgm_enabled = bool(client_cfg.get("cgm"))
+            pump_enabled = bool(client_cfg.get("pump"))
+
+            if cgm_enabled:
+                from core.utils.cgm_manager import CGMManager
+                cgm_manager = CGMManager()
+
+                latest = None
+                if hasattr(cgm_manager, "get_latest_reading"):
+                    latest = cgm_manager.get_latest_reading(client_id)
+                if latest:
+                    result["glucose_now"] = latest.get("glucose")
+
+                # 这里尽量兼容你现有 manager，如果某个方法不存在就跳过
+                if hasattr(cgm_manager, "get_metrics_summary"):
+                    metrics = cgm_manager.get_metrics_summary(client_id)
+                    if isinstance(metrics, dict):
+                        result["cgm_metrics"] = metrics.get("metrics", metrics)
+                        if "events" in metrics and isinstance(metrics["events"], dict):
+                            result["events"] = metrics["events"]
+
+                context_summary = None
+                if hasattr(cgm_manager, "get_context_summary"):
+                    context_summary = cgm_manager.get_context_summary(client_id)
+                if context_summary:
+                    result["patterns"]["daily"].append(context_summary)
+
+            if pump_enabled:
+                from core.utils.pump_manager import PumpManager
+                pump_manager = PumpManager()
+
+                if hasattr(pump_manager, "get_latest_status"):
+                    latest_pump = pump_manager.get_latest_status(client_id)
+                    if isinstance(latest_pump, dict):
+                        result["pump_status"] = latest_pump
+
+                if hasattr(pump_manager, "get_recent_patterns"):
+                    pump_patterns = pump_manager.get_recent_patterns(client_id)
+                    if isinstance(pump_patterns, dict):
+                        result["pump_patterns"] = pump_patterns
+
+                if hasattr(pump_manager, "get_joint_signals"):
+                    pump_joint = pump_manager.get_joint_signals(client_id)
+                    if isinstance(pump_joint, dict):
+                        result["pump_glucose_joint"] = pump_joint
+
+                if hasattr(pump_manager, "detect_anomalies"):
+                    anomalies = pump_manager.detect_anomalies(client_id)
+                    if isinstance(anomalies, list):
+                        result["anomalies"] = anomalies
+                    elif anomalies:
+                        result["anomalies"] = [str(anomalies)]
+
+                pump_context = None
+                if hasattr(pump_manager, "get_context_summary"):
+                    pump_context = pump_manager.get_context_summary(client_id)
+                if pump_context:
+                    result["patterns"]["weekly"].append(pump_context)
+
+        except Exception as e:
+            self.logger.bind(tag=TAG).error(f"Failed to build pipeline analysis result: {e}")
+
+        return result
+
+    def run_coach_pipeline(self, query: str, context_needs: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """Run decision -> interpretation -> persona pipeline for diabetes coaching."""
+        prompts = self.pipeline_prompts or {}
+        persona_prompt = self.prompt or prompts.get("persona", "")
+        decision_prompt = prompts.get("decision", "")
+        interpretation_prompt = prompts.get("interpretation", "")
+
+        if not persona_prompt or not decision_prompt or not interpretation_prompt:
+            return None
+
+        analysis_result = self._build_pipeline_analysis_result(query, context_needs=context_needs)
+
+        decision_raw = self._llm_single_shot(decision_prompt, analysis_result)
+        decision_result = self._safe_parse_json(decision_raw)
+
+        interpretation_payload = {
+            "analysis_result": analysis_result,
+            "decision_result": decision_result,
+        }
+        insight_text = self._llm_single_shot(interpretation_prompt, interpretation_payload)
+        if not insight_text:
+            return None
+
+        persona_payload = {
+            "user_message": query,
+            "insight_text": insight_text,
+            "decision_result": decision_result,
+            "analysis_result": analysis_result,
+        }
+        final_reply = self._llm_single_shot(persona_prompt, persona_payload)
+        return final_reply or insight_text
+    
     def chat(self, query, depth=0):
+        search_text = query or ""
         if query is not None:
             self.logger.bind(tag=TAG).info(f"LLM received user message: {query}")
 
             # Parse Query (could be JSON or Text)
-            search_text = query
             is_json = False
             json_data = {}
 
@@ -1239,9 +1429,44 @@ class ConnectionHandler:
         response_message = []
 
         try:
+            # Layered diabetes-coach pipeline.
+            # Only run at top level for diabetes-related queries when layered prompts are available.
+            should_run_coach_pipeline = False
+            context_for_pipeline = intent_result if 'intent_result' in locals() else {}
+            if depth == 0 and self.pipeline_prompts and isinstance(context_for_pipeline, dict):
+                should_run_coach_pipeline = any([
+                    context_for_pipeline.get("needs_cgm"),
+                    context_for_pipeline.get("needs_pump"),
+                ])
+
+            if should_run_coach_pipeline:
+                try:
+                    coach_reply = self.run_coach_pipeline(
+                        search_text,
+                        context_needs=context_for_pipeline,
+                    )
+                    if coach_reply:
+                        self.logger.bind(tag=TAG).info(f"Coach pipeline reply: {coach_reply}")
+
+                        self.dialogue.put(Message(role="assistant", content=coach_reply))
+
+                        self.tts.tts_text_queue.put(
+                            TTSMessageDTO(
+                                sentence_id=self.sentence_id,
+                                sentence_type=SentenceType.LAST,
+                                content_type=ContentType.TEXT,
+                                content_detail=coach_reply,
+                            )
+                        )
+                        self.llm_finish_task = True
+                        return None
+                except Exception as e:
+                    self.logger.bind(tag=TAG).error(f"Coach pipeline failed, falling back to legacy chat path: {e}")
+
             # Use dialogue with memory
             # Use dialogue with memory
             memory_str = None
+
             if self.memory is not None:
                 future = asyncio.run_coroutine_threadsafe(
                     self.memory.query_memory(query), self.loop
