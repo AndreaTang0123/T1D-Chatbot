@@ -1,6 +1,11 @@
 {
-  "include": ["."],
+  "include": ["server", "analysis"],
+  "exclude": ["**/.venv*", "**/__pycache__", "server/models"],
   "pythonVersion": "3.11",
-  "venvPath": ".",
-  "venv": ".venv"
+  "venvPath": "server",
+  "venv": ".venv311",
+  "executionEnvironments": [
+    { "root": "server" },
+    { "root": "analysis" }
+  ]
 }

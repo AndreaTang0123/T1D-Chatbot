@@ -1,0 +1,49 @@
+# Python / 编辑器 / 系统
+__pycache__/
+*.py[cod]
+.venv*/
+.DS_Store
+.vscode/
+.idea/
+.claude/
+
+# 密钥：只提交模板
+.env
+.env.*
+!.env.example
+
+# 日志、录音、音乐
+*.log
+*.wav
+*.mp3
+*.m4a
+!server/config/assets/**
+
+# server 运行时目录
+server/tmp/
+server/temp/
+server/music/
+
+# 模型：ASR 模型由 modelscope 自动下载到 ~/.cache；只提交 silero VAD 需要的文件
+server/models/*
+!server/models/snakers4_silero-vad/
+server/models/snakers4_silero-vad/*
+!server/models/snakers4_silero-vad/LICENSE
+!server/models/snakers4_silero-vad/src/
+server/models/snakers4_silero-vad/src/*
+!server/models/snakers4_silero-vad/src/silero_vad/
+server/models/snakers4_silero-vad/src/silero_vad/*
+!server/models/snakers4_silero-vad/src/silero_vad/data/
+server/models/snakers4_silero-vad/src/silero_vad/data/*
+!server/models/snakers4_silero-vad/src/silero_vad/data/silero_vad.onnx
+
+# 用户数据（血糖、泵、对话记忆、录音、带 Nightscout 密钥的 config.json）一律不提交。
+# 只放行 server 启动必需的配置，以及 Joe 的 prompt 和配置模板。
+server/data/*
+!server/data/.config.yaml
+!server/data/agent-base-prompt.txt
+!server/data/26ea0ba9-2d55-4368-a56d-19c4a27c0772/
+server/data/26ea0ba9-2d55-4368-a56d-19c4a27c0772/*
+!server/data/26ea0ba9-2d55-4368-a56d-19c4a27c0772/prompt.txt
+!server/data/26ea0ba9-2d55-4368-a56d-19c4a27c0772/prompts/
+!server/data/26ea0ba9-2d55-4368-a56d-19c4a27c0772/config.example.json

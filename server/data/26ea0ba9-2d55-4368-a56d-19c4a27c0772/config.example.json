@@ -1,0 +1,15 @@
+{
+  "asr_module": "fun_local_multilingual",
+  "default_location": "Chapel Hill",
+  "voice": "en-US-AndrewMultilingualNeural",
+  "cgm": {
+    "api_secret": "<sha1 of your Nightscout API secret>",
+    "user_tz": "US/Eastern",
+    "base_url": "https://your-nightscout.example.com"
+  },
+  "pump": {
+    "api_secret": "<sha1 of your Nightscout API secret>",
+    "user_tz": "US/Eastern",
+    "base_url": "https://your-nightscout.example.com"
+  }
+}
