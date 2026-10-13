@@ -1041,9 +1041,10 @@ class ConnectionHandler:
                 "weekly": [],
                 "monthly": [],
             },
+            "pump_data_status": {"status": "no_data"},  # ok / stale / no_data，见 PumpManager.get_data_status
             "pump_status": {},
-            "pump_patterns": {},
-            "pump_glucose_joint": {},
+            "pump_patterns": [],
+            "pump_glucose_joint": [],
             "anomalies": [],
         }
 
@@ -1097,14 +1098,16 @@ class ConnectionHandler:
                 from core.utils.pump_manager import PumpManager
                 pump_manager = PumpManager()
 
-                # Coach pipeline fallback: use authoritative summary if structured methods are missing
-                if hasattr(pump_manager, "get_authoritative_summary"):
-                    pump_context = pump_manager.get_authoritative_summary(client_id)
-                elif hasattr(pump_manager, "get_context_summary"):
-                    pump_context = pump_manager.get_context_summary(client_id)
-
+                pump_context = pump_manager.get_authoritative_summary(client_id)
                 if pump_context:
                     result["pump_status"]["summary"] = pump_context
+
+                result["pump_data_status"] = pump_manager.get_data_status(
+                    client_id, float(self.config.get("pump_stale_after_hours", 6))
+                )
+                result["pump_patterns"] = pump_manager.analyze_recent_patterns(client_id)
+                result["pump_glucose_joint"] = pump_manager.analyze_insulin_effectiveness(client_id)
+                result["anomalies"] = pump_manager.detect_pump_anomalies(client_id)
 
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"Failed to build pipeline analysis result: {e}")

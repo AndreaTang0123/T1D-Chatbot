@@ -131,6 +131,8 @@ exit_replies:
 
 # CGM 读数超过这么多分钟没更新，就告诉 LLM "暂无最新数据"，不能当作当前值
 cgm_stale_after_minutes: 15
+# 最近一次泵事件超过这么多小时，泵的规律、bolus 反应、异常都只当作历史数据
+pump_stale_after_hours: 6
 
 plugins:
   get_weather:

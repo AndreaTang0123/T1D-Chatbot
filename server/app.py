@@ -128,17 +128,11 @@ async def main():
         # Cancel all tasks (critical repair point)
         stdin_task.cancel()
         ws_task.cancel()
-        if ota_task:
-            ota_task.cancel()
-
         cgm_task.cancel()
         pump_task.cancel()
 
         # Wait for task termination (must add timeout)
         tasks_to_wait = [stdin_task, ws_task, cgm_task, pump_task]
-        if ota_task:
-            tasks_to_wait.append(ota_task)
-
         await asyncio.wait(
             tasks_to_wait,
             timeout=3.0,

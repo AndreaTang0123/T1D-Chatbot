@@ -792,8 +792,35 @@ class PumpManager:
         pump_config = self._get_client_config(client_id)
         return bool(pump_config and pump_config.get("base_url") and pump_config.get("api_secret"))
 
+    def _sorted_events(self, client_id: str) -> List[Dict[str, Any]]:
+        rows = self._read_all_events(client_id)
+        try:
+            rows.sort(key=lambda r: int(float(r.get("unix_s", 0))))
+        except Exception:
+            pass
+        return rows
+
+    @staticmethod
+    def _fmt_date(unix_s: Any) -> str:
+        return datetime.fromtimestamp(int(float(unix_s)), tz=EASTERN_TZ).strftime("%Y-%m-%d")
+
+    def get_data_status(self, client_id: str, stale_after_hours: float = 6) -> Dict[str, Any]:
+        """ok / stale / no_data for the latest pump event, so old pump patterns are never presented as current."""
+        rows = self._sorted_events(client_id)
+        if not rows:
+            return {"status": "no_data", "latest_event_date": None, "age_hours": None,
+                    "stale_after_hours": stale_after_hours}
+        last_ts = int(float(rows[-1].get("unix_s", 0)))
+        age_hours = round(max(0, time.time() - last_ts) / 3600, 1)
+        return {
+            "status": "ok" if age_hours <= stale_after_hours else "stale",
+            "latest_event_date": self._fmt_date(last_ts),
+            "age_hours": age_hours,
+            "stale_after_hours": stale_after_hours,
+        }
+
     def analyze_insulin_effectiveness(self, client_id: str) -> List[str]:
-        pump_rows = self._read_all_events(client_id)
+        pump_rows = self._sorted_events(client_id)
         cgm_path = os.path.join(self._client_dir(client_id), "cgm.csv")
 
         if not os.path.exists(cgm_path):
@@ -805,63 +832,58 @@ class PumpManager:
         if not pump_rows or not cgm_rows:
             return []
 
+        cgm_points = [(int(r["unix_s"]), float(r["sgv"])) for r in cgm_rows if r.get("unix_s") and r.get("sgv")]
+
+        # 最近 10 次 bolus（先筛 bolus 再取最后 10 条：temp basal 每几分钟一条，按事件取会几乎取不到 bolus）
+        boluses = [r for r in pump_rows if r.get("category") == "bolus"][-10:]
+
         results = []
-
-        for row in pump_rows[-10:]:  # 看最近10次
-            if row.get("category") != "bolus":
-                continue
-
+        used_ts = []
+        for row in boluses:
             ts = int(float(row["unix_s"]))
 
-            before = [
-                float(r["sgv"])
-                for r in cgm_rows
-                if ts - 1800 <= int(r["unix_s"]) <= ts
-            ]
-
-            after = [
-                float(r["sgv"])
-                for r in cgm_rows
-                if ts + 3600 <= int(r["unix_s"]) <= ts + 4*3600
-            ]
+            before = [v for t, v in cgm_points if ts - 1800 <= t <= ts]
+            after = [v for t, v in cgm_points if ts + 3600 <= t <= ts + 4 * 3600]
 
             if not before or not after:
                 continue
 
-            delta = sum(after)/len(after) - sum(before)/len(before)
-            results.append(delta)
+            results.append(sum(after) / len(after) - sum(before) / len(before))
+            used_ts.append(ts)
 
         if not results:
             return []
 
-        avg_delta = sum(results)/len(results)
-
+        avg_delta = sum(results) / len(results)
         direction = "decreased" if avg_delta < 0 else "increased"
 
         return [
-            f"After recent boluses, glucose {direction} by {abs(avg_delta):.1f} mg/dL on average"
+            f"After the last {len(results)} boluses with CGM coverage "
+            f"({self._fmt_date(used_ts[0])} to {self._fmt_date(used_ts[-1])}), glucose {direction} by "
+            f"{abs(avg_delta):.1f} mg/dL on average (mean 1-4 h after vs 30 min before)"
         ]
 
     def detect_pump_anomalies(self, client_id: str) -> List[str]:
-        rows = self._read_all_events(client_id)
+        rows = self._sorted_events(client_id)
         if not rows:
             return []
 
         recent = rows[-100:]
+        window = f"in the last {len(recent)} pump events, {self._fmt_date(recent[0]['unix_s'])} to {self._fmt_date(recent[-1]['unix_s'])}"
         bolus_count = sum(1 for r in recent if r.get("category") == "bolus")
 
         insights = []
 
         if bolus_count > 20:
-            insights.append("High frequency of bolus events detected recently")
+            insights.append(f"High frequency of bolus events ({bolus_count} {window})")
 
         overnight_temp = [
             r for r in recent
-            if r.get("category") == "temp_basal" and int(r.get("hour", 0)) < 6
+            if r.get("category") == "temp_basal" and int(float(r.get("hour", 0))) < 6
         ]
 
         if len(overnight_temp) > 5:
-            insights.append("Frequent overnight temp basal usage")
+            insights.append(f"Frequent overnight temp basal usage ({len(overnight_temp)} {window})")
 
         return insights
 

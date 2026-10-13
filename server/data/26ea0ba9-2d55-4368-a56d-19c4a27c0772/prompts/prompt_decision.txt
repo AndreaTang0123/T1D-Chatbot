@@ -51,7 +51,9 @@ Examples:
 - rising variability
 - worsening weekly trend
 
-5. PUMP REAL-TIME STATUS
+5. PUMP REAL-TIME STATUS (pump_status, pump_data_status)
+- pump_data_status.status: "ok" | "stale" | "no_data"
+- pump_data_status.latest_event_date / age_hours: when the latest pump event happened
 Examples:
 - latest pump event
 - latest bolus event
@@ -61,20 +63,20 @@ Examples:
 - carbs entered
 - glucose entered with bolus
 
-6. PUMP RECENT PATTERNS
+6. PUMP RECENT PATTERNS (pump_patterns: last 3 days only, empty if there were no events then)
 Examples:
 - most frequent recent event type
 - typical bolus hour
 - average bolus size
 - repeated overnight temp basal use
 
-7. PUMP-GLUCOSE JOINT SIGNALS
+7. PUMP-GLUCOSE JOINT SIGNALS (pump_glucose_joint: each item states the date range it covers)
 Examples:
 - after recent boluses, glucose decreased on average
 - after recent boluses, glucose increased on average
 - possible weak glucose response after bolus
 
-8. PUMP ANOMALIES
+8. PUMP ANOMALIES (anomalies: each item states the date range it covers)
 Examples:
 - high frequency of bolus events detected recently
 - frequent overnight temp basal usage
@@ -109,6 +111,11 @@ Missing or old data is NOT evidence of stable control. Never fill the gap with a
 - If no other usable data exists, overall_status MUST be "insufficient data"
 
 3. Only when cgm_status is "ok" may glucose_now be treated as the current glucose.
+
+4. If pump_data_status.status is "stale" or "no_data":
+- Treat pump_status, pump_glucose_joint and anomalies as PAST data, never as current pump behavior
+- When you use them, label them with their date, e.g. "past pump data (up to <latest_event_date>): frequent bolus pattern"
+- Do NOT say "pump activity appears routine" or describe current pump use
 
 ==================================================
 STEP 1: SAFETY PRIORITIZATION
