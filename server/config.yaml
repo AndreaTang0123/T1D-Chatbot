@@ -129,6 +129,9 @@ exit_replies:
   - "Bye for now!"
   - "Catch you later!"
 
+# CGM 读数超过这么多分钟没更新，就告诉 LLM "暂无最新数据"，不能当作当前值
+cgm_stale_after_minutes: 15
+
 plugins:
   get_weather:
     default_location: "Chapel Hill"

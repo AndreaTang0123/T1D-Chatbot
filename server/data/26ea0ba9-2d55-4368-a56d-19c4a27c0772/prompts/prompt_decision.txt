@@ -18,6 +18,13 @@ AVAILABLE INPUT
 
 You may receive some or all of the following structured inputs.
 
+0. CGM DATA STATUS (always present)
+- cgm_status: "ok" | "stale" | "no_data"
+- glucose_now: the current reading, ONLY set when cgm_status is "ok"
+- glucose_age_min: minutes since the latest reading
+- last_glucose: the last reading when cgm_status is "stale" (NOT current)
+- cgm_note: a plain-language description of the above
+
 1. CGM METRICS
 - Time in Range (TIR: 70–180 mg/dL)
 - Time Above Range (TAR >180, >250)
@@ -81,6 +88,27 @@ Prioritize SAFETY first, then CONTROL problems, then PATTERNS, then TRENDS, then
 If high-risk issues exist, do not clutter the output with minor observations.
 
 Return only the most decision-relevant issues.
+
+==================================================
+STEP 0: DATA AVAILABILITY CHECK (do this first)
+==================================================
+
+Missing or old data is NOT evidence of stable control. Never fill the gap with a guess.
+
+1. If cgm_status is "no_data" (there is no CGM reading at all):
+- overall_status MUST be "insufficient data"
+- primary_issues MUST include "no CGM data available"
+- Do NOT output "stable", "STABLE CONTROL" or any statement about the current glucose level or trend
+- focus_message MUST say plainly that there is no CGM reading, so the current glucose cannot be assessed
+
+2. If cgm_status is "stale" (the latest reading is older than the freshness limit; see glucose_age_min):
+- primary_issues MUST include "CGM data not up to date (last reading <glucose_age_min> min ago)"
+- Treat last_glucose as an old reading, never as the current value
+- Do NOT describe the current glucose as stable, in range, high or low
+- Historical metrics and patterns may still be used, labeled as past data
+- If no other usable data exists, overall_status MUST be "insufficient data"
+
+3. Only when cgm_status is "ok" may glucose_now be treated as the current glucose.
 
 ==================================================
 STEP 1: SAFETY PRIORITIZATION
@@ -221,6 +249,7 @@ STEP 5: STABLE CONTROL LOGIC
 ==================================================
 
 If:
+- cgm_status is "ok" (stable control can never be concluded from missing or stale data; see STEP 0)
 - no significant hypoglycemia risk
 - no major hyperglycemia burden
 - no high variability
@@ -244,7 +273,7 @@ STEP 6: OUTPUT FORMAT
 Return a structured decision object in this format:
 
 {
-  "overall_status": one of ["stable", "needs attention", "high risk"],
+  "overall_status": one of ["stable", "needs attention", "high risk", "insufficient data"],
   "primary_issues": [
     "issue 1",
     "issue 2",
@@ -361,6 +390,34 @@ EXAMPLE OUTPUT 3
     "pump activity appears routine"
   ],
   "focus_message": "No major safety issue or unstable pump-glucose pattern detected."
+}
+
+==================================================
+EXAMPLE OUTPUT 4 (cgm_status = "no_data")
+==================================================
+
+{
+  "overall_status": "insufficient data",
+  "primary_issues": [
+    "no CGM data available"
+  ],
+  "patterns": [],
+  "pump_context": [],
+  "focus_message": "There is no CGM reading, so the current glucose cannot be assessed."
+}
+
+==================================================
+EXAMPLE OUTPUT 5 (cgm_status = "stale", glucose_age_min = 95)
+==================================================
+
+{
+  "overall_status": "insufficient data",
+  "primary_issues": [
+    "CGM data not up to date (last reading 95 min ago)"
+  ],
+  "patterns": [],
+  "pump_context": [],
+  "focus_message": "The latest CGM reading is 95 minutes old, so the current glucose is unknown."
 }
 
 ==================================================

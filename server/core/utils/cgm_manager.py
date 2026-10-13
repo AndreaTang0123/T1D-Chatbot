@@ -15,6 +15,31 @@ from config.logger import setup_logging
 TAG = "cgm_manager"
 logger = setup_logging()
 
+# 读数超过这么多分钟没更新就算过期（config.yaml 的 cgm_stale_after_minutes 可覆盖）
+DEFAULT_STALE_AFTER_MIN = 15
+
+NO_DATA_NOTE = (
+    "[CGM: 暂无数据 / no CGM reading is available. Do NOT guess, estimate or describe the user's "
+    "glucose or say it is stable. If glucose comes up, tell the user plainly that you can't see a reading right now.]"
+)
+
+
+def format_cgm_status(status: Dict[str, Any]) -> str:
+    """One context line for the LLM describing the current CGM reading, or the lack of one."""
+    if status.get("status") == "ok":
+        glucose, direction, age = status["glucose"], status["direction"], status["age_min"]
+        if glucose < 70 or glucose > 250:
+            return f"[CRITICAL CGM: {glucose} mg/dL, {direction}, {age} min ago]"
+        return f"[Current CGM: {glucose} mg/dL, {direction}, {age} min ago]"
+    if status.get("status") == "stale":
+        return (
+            f"[CGM: 暂无最新数据 / no current reading. The last reading was {status['glucose']} mg/dL "
+            f"({status['direction']}) {status['age_min']} min ago, older than {status['stale_after_min']} min, "
+            f"so it is NOT current. If glucose comes up, tell the user plainly that the data is not up to date "
+            f"and how old the last reading is. Do not present it as the current value.]"
+        )
+    return NO_DATA_NOTE
+
 class CGMManager:
     def __init__(self, config=None):
         self.config = config or load_config()
@@ -183,6 +208,21 @@ class CGMManager:
         except Exception as e:
             logger.bind(tag=TAG).error(f"Failed to get latest reading: {e}")
             return None
+
+    def get_current_status(self, client_id: str, stale_after_min: int = DEFAULT_STALE_AFTER_MIN) -> Dict[str, Any]:
+        """Classify the latest reading as ok / stale / no_data so the LLM never treats old or missing data as current."""
+        latest = self.get_latest_reading(client_id)
+        if not latest or not latest.get("unix_s"):
+            return {"status": "no_data", "glucose": None, "direction": None, "age_min": None,
+                    "stale_after_min": stale_after_min}
+        age_min = max(0, (int(time.time()) - latest["unix_s"]) // 60)
+        return {
+            "status": "ok" if age_min <= stale_after_min else "stale",
+            "glucose": latest.get("glucose"),
+            "direction": latest.get("direction", "Unknown"),
+            "age_min": age_min,
+            "stale_after_min": stale_after_min,
+        }
 
     def get_realtime_status(self, client_id: str) -> str:
         """Return a short string summary of current state"""

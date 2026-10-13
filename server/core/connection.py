@@ -1028,7 +1028,12 @@ class ConnectionHandler:
             "user_query": query,
             "language_hint": getattr(self, "current_language_tag", None),
             "intent_context": context_needs or {},
-            "glucose_now": None,
+            "cgm_status": "no_data",  # ok / stale / no_data
+            "glucose_now": None,  # 只有 cgm_status == "ok" 时才有值
+            "glucose_direction": None,
+            "glucose_age_min": None,
+            "last_glucose": None,  # stale 时的最后一次读数，不能当作当前值
+            "cgm_note": None,
             "cgm_metrics": {},
             "events": {},
             "patterns": {
@@ -1056,15 +1061,23 @@ class ConnectionHandler:
             cgm_enabled = bool(client_cfg.get("cgm"))
             pump_enabled = bool(client_cfg.get("pump"))
 
+            from core.utils.cgm_manager import CGMManager, format_cgm_status, NO_DATA_NOTE
+            result["cgm_note"] = NO_DATA_NOTE
+
             if cgm_enabled:
-                from core.utils.cgm_manager import CGMManager
                 cgm_manager = CGMManager()
 
-                latest = None
-                if hasattr(cgm_manager, "get_latest_reading"):
-                    latest = cgm_manager.get_latest_reading(client_id)
-                if latest:
-                    result["glucose_now"] = latest.get("glucose")
+                cgm_state = cgm_manager.get_current_status(
+                    client_id, int(self.config.get("cgm_stale_after_minutes", 15))
+                )
+                result["cgm_status"] = cgm_state["status"]
+                result["glucose_direction"] = cgm_state["direction"]
+                result["glucose_age_min"] = cgm_state["age_min"]
+                result["cgm_note"] = format_cgm_status(cgm_state)
+                if cgm_state["status"] == "ok":
+                    result["glucose_now"] = cgm_state["glucose"]
+                elif cgm_state["status"] == "stale":
+                    result["last_glucose"] = cgm_state["glucose"]
 
                 # 这里尽量兼容你现有 manager，如果某个方法不存在就跳过
                 if hasattr(cgm_manager, "get_metrics_summary"):
@@ -1289,6 +1302,7 @@ class ConnectionHandler:
                             context_list.append(hist_context)
 
                         # CGM RAG from Config
+                        cgm_status_injected = False
                         rag_config_path = os.path.join("data", client_id, "config.json")
                         if os.path.exists(rag_config_path):
                             with open(rag_config_path, "r") as f:
@@ -1301,41 +1315,25 @@ class ConnectionHandler:
                                 # Config format: {"cgm": {"api_secret": "...", "user_tz": "..."}}
                                 cgm_config = c.get("cgm")
                                 if cgm_config:
-                                    # Always include current reading (like time/date)
-                                    # Only fetch from service if data is stale (>5 min)
-                                    from core.utils.cgm_manager import CGMManager
-                                    import time as time_module
+                                    # Always include the current reading (like time/date); the prompt rules decide when to MENTION it.
+                                    # Refresh from Nightscout first if the local copy is older than 5 min.
+                                    from core.utils.cgm_manager import CGMManager, format_cgm_status
                                     cgm_manager = CGMManager()
-                                    
-                                    current_reading = cgm_manager.get_latest_reading(client_id)
-                                    cgm_is_critical = False
-                                    
-                                    if current_reading:
-                                        glucose = current_reading.get("glucose", 0)
-                                        direction = current_reading.get("direction", "Unknown")
-                                        last_ts = current_reading.get("unix_s", 0)
-                                        now_ts = int(time_module.time())
-                                        data_age_min = (now_ts - last_ts) // 60
-                                        
-                                        # Refresh from service if data is stale (>5 min)
-                                        if data_age_min > 5:
-                                            self.logger.bind(tag=TAG).debug(f"CGM data stale ({data_age_min}min), refreshing...")
-                                            cgm_manager.fetch_and_update(client_id)
-                                            current_reading = cgm_manager.get_latest_reading(client_id)
-                                            if current_reading:
-                                                glucose = current_reading.get("glucose", 0)
-                                                direction = current_reading.get("direction", "Unknown")
-                                        
-                                        cgm_is_critical = glucose < 70 or glucose > 250
-                                        
-                                        # Always add current reading to context (like time/date)
-                                        # The LLM prompt rules decide when to MENTION it
-                                        cgm_status = f"[Current CGM: {glucose} mg/dL, {direction}]"
-                                        if cgm_is_critical:
-                                            cgm_status = f"[CRITICAL CGM: {glucose} mg/dL, {direction}]"
-                                            self.logger.bind(tag=TAG).warning(f"CGM critical: {glucose} for {client_id}")
-                                        context_list.append(cgm_status)
-                                    
+                                    stale_after = int(self.config.get("cgm_stale_after_minutes", 15))
+
+                                    cgm_state = cgm_manager.get_current_status(client_id, stale_after)
+                                    if cgm_state["status"] == "no_data" or cgm_state["age_min"] > 5:
+                                        self.logger.bind(tag=TAG).debug(f"CGM data missing or older than 5 min ({cgm_state['age_min']}), refreshing...")
+                                        cgm_manager.fetch_and_update(client_id)
+                                        cgm_state = cgm_manager.get_current_status(client_id, stale_after)
+
+                                    if cgm_state["status"] == "ok" and (cgm_state["glucose"] < 70 or cgm_state["glucose"] > 250):
+                                        self.logger.bind(tag=TAG).warning(f"CGM critical: {cgm_state['glucose']} for {client_id}")
+                                    elif cgm_state["status"] != "ok":
+                                        self.logger.bind(tag=TAG).info(f"CGM {cgm_state['status']} for {client_id} (age_min={cgm_state['age_min']})")
+                                    context_list.append(format_cgm_status(cgm_state))
+                                    cgm_status_injected = True
+
                                     # Full CGM context (trends, patterns) only if user asks
                                     if context_needs.get("needs_cgm"):
                                         cgm_summary = cgm_manager.get_context_summary(client_id)
@@ -1375,7 +1373,13 @@ class ConnectionHandler:
                                     context_needs.get("needs_search"),
                                 ]):
                                     self.logger.bind(tag=TAG).debug(f"Context classifier: no extra injection needed")
-                                     
+
+                        # 用户问到血糖、但这个用户没有配置 CGM：明确告诉 LLM 暂无数据，避免它编一个读数
+                        if not cgm_status_injected and intent_result.get("needs_cgm"):
+                            from core.utils.cgm_manager import NO_DATA_NOTE
+                            self.logger.bind(tag=TAG).info(f"CGM requested but not configured for {client_id}: injecting no-data note")
+                            context_list.append(NO_DATA_NOTE)
+
                         # Inject Context into Query
                         if context_list:
                             full_context = "\n".join(context_list)

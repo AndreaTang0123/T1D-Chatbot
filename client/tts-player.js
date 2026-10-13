@@ -16,7 +16,7 @@ const TTSPlayer = (() => {
   const VOICES_WAIT_MS = 1500;          // Safari 有时不触发 voiceschanged
 
   const LABEL_CLOUD = '✨ Puck Neural Voice';
-  const LABEL_BROWSER = '✨ Puck Voice (Browser)';
+  const LABEL_BROWSER = '✨ Browser Voice'; // 开始朗读后换成实际的声音名
 
   const $label = document.getElementById('voiceLabel');
   const audio = new Audio();
@@ -149,6 +149,7 @@ const TTSPlayer = (() => {
         console.log('[tts] browser utterance error', e.error);
         resolve();
       };
+      if ($label) $label.textContent = v ? '✨ ' + v.name : LABEL_BROWSER;
       console.log('[tts] browser speak lang=' + lang + ' voice=' + (v ? v.name + ' (' + v.lang + ')' : 'system default') + ' chars=' + text.length);
       speechSynthesis.speak(u);
     }));

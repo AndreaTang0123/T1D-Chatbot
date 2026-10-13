@@ -46,7 +46,7 @@ server 的启动方式见仓库根目录的 README（`cd server && .venv311/bin/
 右上角的标签显示当前（或下一轮）使用的语音：
 
 - `✨ Puck Neural Voice`：Gemini 云端语音
-- `✨ Puck Voice (Browser)`：浏览器语音。出现在 `local_only` 模式、没有配置 key，或者云端失败之后
+- `✨ <声音名>`（例如 `✨ Ava (Premium)`）：浏览器语音，显示实际使用的系统声音。出现在 `local_only` 模式、没有配置 key，或者云端失败之后。朗读开始前显示 `✨ Browser Voice`
 
 降级的触发条件：没有 key、配额超限、模型不可用、网络错误，或者第一段音频 5 秒内没有返回。降级后 60 秒内的回复都直接用浏览器语音，避免每轮都要等超时；60 秒后自动重试云端。
 
@@ -82,7 +82,7 @@ server 的启动方式见仓库根目录的 README（`cd server && .venv311/bin/
 1. 把 `.env` 里的 `GEMINI_API_KEY` 改成一个错误的值（例如在末尾加个 `x`），重启 `serve.py`。
 2. 发一条消息。
 3. 预期结果：
-   - 1 秒内改为浏览器语音读出，标签变成 `✨ Puck Voice (Browser)`；
+   - 1 秒内改为浏览器语音读出，标签变成浏览器声音的名字（例如 `✨ Ava (Premium)`）；
    - 控制台有 `cloud failed, falling back to browser voice: HTTP 502`；
    - `serve.py` 终端有 `cloud TTS failed … API key not valid`。
 4. 想测超时的话：断开 Mac 的网络（保持 Tailscale 连接）再发消息，约 5 秒后应该降级。
@@ -91,7 +91,7 @@ server 的启动方式见仓库根目录的 README（`cd server && .venv311/bin/
 **3. `local_only`**
 1. `.env` 中设 `TTS_MODE=local_only`，重启 `serve.py`。终端应打印 `local_only: /api/tts 一律 403`。
 2. 发一条消息。
-3. 预期结果：标签显示 `✨ Puck Voice (Browser)`，控制台有 `path=browser`。
+3. 预期结果：标签显示浏览器声音的名字，控制台有 `path=browser`。
 4. 确认没有文本被发往外部：
    - `serve.py` 终端不应出现任何 `POST /api/tts` 记录；
    - 浏览器 Network 面板里不应有 `/api/tts` 请求；
