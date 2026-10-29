@@ -95,9 +95,6 @@ class ServerPluginExecutor(ToolExecutor):
         """Get all registered server plugin tools"""
         tools = {}
 
-        # Get necessary functions
-        necessary_functions = ["handle_exit_intent", "get_lunar"]
-
         # Get functions in config
         config_functions = self.config["Intent"][
             self.config["selected_module"]["Intent"]
@@ -110,8 +107,8 @@ class ServerPluginExecutor(ToolExecutor):
             except TypeError:
                 config_functions = []
 
-        # Merge all required functions
-        all_required_functions = list(set(necessary_functions + config_functions))
+        # Deduplicate, keeping config order
+        all_required_functions = list(dict.fromkeys(config_functions))
 
         for func_name in all_required_functions:
             func_item = all_function_registry.get(func_name)

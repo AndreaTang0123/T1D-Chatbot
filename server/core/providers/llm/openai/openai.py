@@ -124,34 +124,14 @@ class LLMProvider(LLMProviderBase):
             if value is not None:
                 request_params[key] = value
 
+        # Standard OpenAI SDK per-request timeout
+        request_timeout = kwargs.get("timeout", self.timeout)
+        request_retries = kwargs.get("max_retries", self.max_retries)
 
-            
-            # Support for checking num_ctx in config (passed via self.xxx if we add it to init)
-            # We need to add it to init first, or just check config again? 
-            # Better to check if we can access config. config is passed to init.
-            # We should update init to read num_ctx.
-            
-            # Wait, I cannot edit init in this same tool call easily if I am targeting line 81.
-            # I will assume I need to do 2 edits or one big edit.
-            # For now, let's just use getattr(self, 'num_ctx', None) and assume I added it to init.
-            
-            extra_body = {}
-            if getattr(self, "num_ctx", None):
-                 # Ollama uses "options" for parameters in the OpenAI endpoint often,
-                 # BUT some versions mapping allow "num_ctx" at top level of extra_body??
-                 # "options" is the safest for Ollama native parameters.
-                 extra_body["options"] = {"num_ctx": int(self.num_ctx)}
-            
-            # Standard OpenAI SDK per-request timeout
-            request_timeout = kwargs.get("timeout", self.timeout)
-            request_retries = kwargs.get("max_retries", self.max_retries)
-
-            responses = self.client.with_options(max_retries=request_retries).chat.completions.create(
-                **request_params,
-                timeout=request_timeout
-            )
-
-        responses = self.client.chat.completions.create(**request_params)
+        responses = self.client.with_options(max_retries=request_retries).chat.completions.create(
+            **request_params,
+            timeout=request_timeout
+        )
 
         is_active = True
         try:            
@@ -174,31 +154,6 @@ class LLMProvider(LLMProviderBase):
             responses.close()
 
     def response_with_functions(self, session_id, dialogue, functions=None, **kwargs):
-        dialogue = self.normalize_dialogue(dialogue)
-
-        request_params = {
-            "model": self.model_name,
-            "messages": dialogue,
-            "stream": True,
-            "tools": functions,
-        }
-
-        optional_params = {
-            "max_tokens": kwargs.get("max_tokens", self.max_tokens),
-            "temperature": kwargs.get("temperature", self.temperature),
-            "top_p": kwargs.get("top_p", self.top_p),
-            "frequency_penalty": kwargs.get("frequency_penalty", self.frequency_penalty),
-        }
-
-        for key, value in optional_params.items():
-            if value is not None:
-                request_params[key] = value
-
-        # 禁用思考模式
-        self._apply_thinking_disabled(request_params)
-
-        stream = self.client.chat.completions.create(**request_params)
-
         try:
             dialogue = self.normalize_dialogue(dialogue)
 
@@ -223,11 +178,14 @@ class LLMProvider(LLMProviderBase):
                 if value is not None:
                     request_params[key] = value
 
+            # 禁用思考模式
+            self._apply_thinking_disabled(request_params)
+
             # Standard OpenAI SDK per-request timeout
             request_timeout = kwargs.get("timeout", self.timeout)
             request_retries = kwargs.get("max_retries", self.max_retries)
 
-            stream = self.client.with_options(max_retries=request_retries).chat.completions.create(
+            stream =self.client.with_options(max_retries=request_retries).chat.completions.create(
                 **request_params,
                 timeout=request_timeout
             )

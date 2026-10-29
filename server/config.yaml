@@ -18,7 +18,7 @@ selected_module:
   ASR: "fun_local"
   TTS: "edge"
   LLM: "openai"
-  Intent: "nointent_mode"
+  Intent: "function_call"
 
 # 3. VAD Settings
 VAD:
@@ -61,14 +61,6 @@ LLM:
     num_ctx: 32768 # Increased for 16GB RAM: enables processing longer news timelines and history
     temperature: 0.5 # Controls randomness (0.0 to 2.0). Default is 1.0. Lower is more deterministic.
 
-  fast_intent:
-    type: "openai"
-    base_url: "http://localhost:11434/v1"
-    api_key: "ollama"
-    model_name: "qwen2.5:3b"
-    timeout: 2 # Strict timeout for intent classification
-    max_retries: 0
-
 # 6. TTS Settings
 TTS:
   edge:
@@ -101,15 +93,14 @@ xiaozhi:
   llm_handshake: true
 
 # 11. Intent Settings
+# 主 LLM 自己决定要不要调用工具（时间/天气/地点由 core/utils/fast_intent.py 的规则直接回答）
 Intent:
-  nointent_mode:
-    type: "nointent"
-  llm:
-    type: "intent_llm"
-    llm: "fast_intent"
+  function_call:
+    type: "function_call"
     functions:
-      - "get_weather"
-      - "get_location"
+      - "get_diabetes_data"  # CGM / 泵分析：工具内部跑 decision -> interpretation，主模型按 persona 回答
+      - "web_search"         # DuckDuckGo
+      - "get_weather"        # 非本地天气（本地天气已在 system prompt 的 <context> 里）
       - "say_goodbye"
 
 wakeup_words:

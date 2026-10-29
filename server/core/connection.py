@@ -11,7 +11,6 @@ import threading
 import traceback
 import subprocess
 import websockets
-from core.utils.exit_handler import is_exit_command, handle_exit
 
 import re
 from datetime import datetime
@@ -22,7 +21,7 @@ from core.utils.util import (
     check_asr_update,
     filter_sensitive_info,
 )
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from collections import deque
 from core.utils.modules_initialize import (
     initialize_modules,
@@ -47,7 +46,7 @@ from core.utils.prompt_manager import PromptManager
 from core.utils.voiceprint_provider import VoiceprintProvider
 from core.utils import textUtils
 from core.utils.history_rag import history_rag
-from plugins_func.functions.get_weather import get_weather
+from core.utils.fast_intent import match_fast_intent, get_fast_answer
 
 
 TAG = __name__
@@ -57,26 +56,6 @@ auto_import_modules("plugins_func.functions")
 
 class TTSException(RuntimeError):
     pass
-
-# direct_answer 虚拟工具定义
-# 不是真实工具，是路由机制：将"调不调工具"的二选一变为"调哪个"的多选，防止小模型误触发真实工具
-DIRECT_ANSWER_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "direct_answer",
-        "description": "当用户的请求不匹配其他任何工具时，可用此选项直接回复。将回复内容写在response参数里。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "response": {
-                    "type": "string",
-                    "description": "你回复用户的完整内容",
-                },
-            },
-            "required": ["response"],
-        },
-    },
-}
 
 
 class ConnectionHandler:
@@ -517,65 +496,6 @@ class ConnectionHandler:
             self.logger.bind(tag=TAG).debug("System prompt enhanced successfully")
 
 
-    def _inject_tool_call_fewshot(self):
-        """注入工具调用 few-shot 示例到对话历史。
-        结构：正样本（工具调用示例）放在动态 system 之前，可命中前缀缓存；
-        负样本（直接回答示例）放在动态 system 之后、紧挨真实用户消息，
-        确保模型在处理用户消息前最后看到的是"不调工具"的行为模式。
-        """
-        if self.intent_type != "function_call":
-            return
-        if not hasattr(self, "func_handler") or self.func_handler is None:
-            return
-
-        tools = self.func_handler.get_functions()
-        if not tools:
-            return
-
-        tool_names = {t.get("function", {}).get("name") for t in tools}
-
-        # === few-shot 示例（is_temporary）===
-        # 展示 direct_answer 携带 response 参数的用法，一次调用完成回复
-
-        # 示例1：direct_answer（回复内容写在 response 参数里，无需递归）
-        da_tc_id = "fewshot_da_001"
-        self.dialogue.put(Message(role="user", content="给我讲个故事吧", is_temporary=True))
-        self.dialogue.put(Message(
-            role="assistant",
-            tool_calls=[{
-                "id": da_tc_id,
-                "function": {"arguments": '{"response": "好呀，你想听什么类型的呀？童话、冒险还是搞笑的？选一个我给你开讲~"}', "name": "direct_answer"},
-                "type": "function", "index": 0,
-            }],
-            is_temporary=True,
-        ))
-        self.dialogue.put(Message(
-            role="tool", tool_call_id=da_tc_id,
-            content="已直接回复", is_temporary=True,
-        ))
-
-        # 示例2：真实工具调用（handle_exit_intent）
-        if "handle_exit_intent" in tool_names:
-            tc_id = "fewshot_exit_001"
-            self.dialogue.put(Message(role="user", content="拜拜", is_temporary=True))
-            self.dialogue.put(Message(
-                role="assistant",
-                tool_calls=[{
-                    "id": tc_id,
-                    "function": {"arguments": '{"say_goodbye": "再见，下次再聊~"}', "name": "handle_exit_intent"},
-                    "type": "function", "index": 0,
-                }],
-                is_temporary=True,
-            ))
-            self.dialogue.put(Message(
-                role="tool", tool_call_id=tc_id,
-                content="退出意图已处理", is_temporary=True,
-            ))
-            self.dialogue.put(Message(
-                role="assistant", content="再见，下次再聊~", is_temporary=True,
-            ))
-
-        self.logger.bind(tag=TAG).debug("已注入工具调用 few-shot 示例")
 
     def _init_report_threads(self):
         """Initialize ASR and TTS report threads"""
@@ -939,55 +859,6 @@ class ConnectionHandler:
             self.logger.bind(tag=TAG).error(f"Failed to load pipeline prompts: {e}")
             self.pipeline_prompts = {}
 
-    def _llm_single_shot(self, system_prompt: str, user_payload: Any) -> str:
-        """Run a one-shot LLM call without mutating the main dialogue history."""
-        if not self.llm:
-            return ""
-
-        try:
-            if isinstance(user_payload, str):
-                user_content = user_payload
-            else:
-                user_content = json.dumps(user_payload, ensure_ascii=False, indent=2)
-
-            temp_dialogue = Dialogue()
-            temp_dialogue.update_system_message(system_prompt)
-            temp_dialogue.put(Message(role="user", content=user_content))
-
-            memory_str = None
-            messages = temp_dialogue.get_llm_dialogue_with_memory(
-                memory_str, self.config.get("voiceprint", {})
-            )
-
-            chunks = []
-            temp_session_id = str(uuid.uuid4())
-            for chunk in self.llm.response(temp_session_id, messages):
-                if chunk:
-                    chunks.append(chunk)
-            return "".join(chunks).strip()
-        except Exception as e:
-            self.logger.bind(tag=TAG).error(f"Single-shot LLM call failed: {e}")
-            return ""
-
-    def _safe_parse_json(self, raw_text: str) -> Dict[str, Any]:
-        """Parse JSON response safely, with fallback extraction from free text."""
-        if not raw_text:
-            return {}
-
-        try:
-            return json.loads(raw_text)
-        except Exception:
-            pass
-
-        extracted = extract_json_from_string(raw_text)
-        if extracted:
-            try:
-                return json.loads(extracted)
-            except Exception:
-                pass
-
-        self.logger.bind(tag=TAG).warning(f"Failed to parse JSON response: {raw_text[:200]}")
-        return {}
     def _filter_stale_realtime_summary_lines(self, summary_text: str) -> str:
         if not summary_text:
             return ""
@@ -1022,130 +893,6 @@ class ConnectionHandler:
 
         return "\n".join(kept_lines).strip()
 
-    def _build_pipeline_analysis_result(self, query: str, context_needs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Build structured analysis input for the decision / interpretation pipeline."""
-        result = {
-            "user_query": query,
-            "language_hint": getattr(self, "current_language_tag", None),
-            "intent_context": context_needs or {},
-            "cgm_status": "no_data",  # ok / stale / no_data
-            "glucose_now": None,  # 只有 cgm_status == "ok" 时才有值
-            "glucose_direction": None,
-            "glucose_age_min": None,
-            "last_glucose": None,  # stale 时的最后一次读数，不能当作当前值
-            "cgm_note": None,
-            "cgm_metrics": {},
-            "events": {},
-            "patterns": {
-                "daily": [],
-                "weekly": [],
-                "monthly": [],
-            },
-            "pump_data_status": {"status": "no_data"},  # ok / stale / no_data，见 PumpManager.get_data_status
-            "pump_status": {},
-            "pump_patterns": [],
-            "pump_glucose_joint": [],
-            "anomalies": [],
-        }
-
-        client_id = self.headers.get("client-id") if self.headers else None
-        if not client_id:
-            return result
-
-        try:
-            config_path = os.path.join("data", client_id, "config.json")
-            client_cfg = {}
-            if os.path.exists(config_path):
-                with open(config_path, "r", encoding="utf-8") as f:
-                    client_cfg = json.load(f)
-
-            cgm_enabled = bool(client_cfg.get("cgm"))
-            pump_enabled = bool(client_cfg.get("pump"))
-
-            from core.utils.cgm_manager import CGMManager, format_cgm_status, NO_DATA_NOTE
-            result["cgm_note"] = NO_DATA_NOTE
-
-            if cgm_enabled:
-                cgm_manager = CGMManager()
-
-                cgm_state = cgm_manager.get_current_status(
-                    client_id, int(self.config.get("cgm_stale_after_minutes", 15))
-                )
-                result["cgm_status"] = cgm_state["status"]
-                result["glucose_direction"] = cgm_state["direction"]
-                result["glucose_age_min"] = cgm_state["age_min"]
-                result["cgm_note"] = format_cgm_status(cgm_state)
-                if cgm_state["status"] == "ok":
-                    result["glucose_now"] = cgm_state["glucose"]
-                elif cgm_state["status"] == "stale":
-                    result["last_glucose"] = cgm_state["glucose"]
-
-                # 这里尽量兼容你现有 manager，如果某个方法不存在就跳过
-                if hasattr(cgm_manager, "get_metrics_summary"):
-                    metrics = cgm_manager.get_metrics_summary(client_id)
-                    if isinstance(metrics, dict):
-                        result["cgm_metrics"] = metrics.get("metrics", metrics)
-                        if "events" in metrics and isinstance(metrics["events"], dict):
-                            result["events"] = metrics["events"]
-
-                context_summary = None
-                if hasattr(cgm_manager, "get_context_summary"):
-                    context_summary = cgm_manager.get_context_summary(client_id)
-                if context_summary:
-                    result["patterns"]["daily"].append(context_summary)
-
-            if pump_enabled:
-                from core.utils.pump_manager import PumpManager
-                pump_manager = PumpManager()
-
-                pump_context = pump_manager.get_authoritative_summary(client_id)
-                if pump_context:
-                    result["pump_status"]["summary"] = pump_context
-
-                result["pump_data_status"] = pump_manager.get_data_status(
-                    client_id, float(self.config.get("pump_stale_after_hours", 6))
-                )
-                result["pump_patterns"] = pump_manager.analyze_recent_patterns(client_id)
-                result["pump_glucose_joint"] = pump_manager.analyze_insulin_effectiveness(client_id)
-                result["anomalies"] = pump_manager.detect_pump_anomalies(client_id)
-
-        except Exception as e:
-            self.logger.bind(tag=TAG).error(f"Failed to build pipeline analysis result: {e}")
-
-        return result
-
-    def run_coach_pipeline(self, query: str, context_needs: Optional[Dict[str, Any]] = None) -> Optional[str]:
-        """Run decision -> interpretation -> persona pipeline for diabetes coaching."""
-        prompts = self.pipeline_prompts or {}
-        persona_prompt = self.prompt or prompts.get("persona", "")
-        decision_prompt = prompts.get("decision", "")
-        interpretation_prompt = prompts.get("interpretation", "")
-
-        if not persona_prompt or not decision_prompt or not interpretation_prompt:
-            return None
-
-        analysis_result = self._build_pipeline_analysis_result(query, context_needs=context_needs)
-
-        decision_raw = self._llm_single_shot(decision_prompt, analysis_result)
-        decision_result = self._safe_parse_json(decision_raw)
-
-        interpretation_payload = {
-            "analysis_result": analysis_result,
-            "decision_result": decision_result,
-        }
-        insight_text = self._llm_single_shot(interpretation_prompt, interpretation_payload)
-        if not insight_text:
-            return None
-
-        persona_payload = {
-            "user_message": query,
-            "insight_text": insight_text,
-            "decision_result": decision_result,
-            "analysis_result": analysis_result,
-        }
-        final_reply = self._llm_single_shot(persona_prompt, persona_payload)
-        return final_reply or insight_text
-    
     def chat(self, query, depth=0, audio_data=None):
         search_text = query or ""
         if query is not None:
@@ -1165,77 +912,37 @@ class ConnectionHandler:
                 except json.JSONDecodeError:
                     pass
 
-                # 1. Intent Classification (Unified call for shortcuts, CGM context, pump context, and search injection)
-                intent_result = {
-                    "needs_cgm": False,
-                    "needs_pump": False,
-                    "needs_search": False,
-                    "fast_answer": None,
-                    "reply": None,
-                }
+                # 1. Rule-based fast answers (time, weather, location) - skip the LLM entirely.
+                # Exit commands are handled earlier in handle_user_intent; everything else goes to the
+                # main LLM, which decides by itself whether to call get_diabetes_data / web_search.
                 try:
                     client_id = self.headers.get("client-id") if self.headers else None
-                    if client_id:
-                        from core.utils.cgm_intent import classify_context_needs
-                        intent_result = classify_context_needs(
-                            search_text, 
-                            client_id, 
-                            self.config, 
-                            language_hint=getattr(self, "current_language_tag", None)
-                        )
-                except Exception as e:
-                    self.logger.bind(tag=TAG).error(f"Intent classification failed: {e}")
-
-                # 2. Fast Intent Check (time, weather, location, exit - skip main LLM)
-                try:
-                    client_id = self.headers.get("client-id") if self.headers else None
-                    if client_id:
-                        from core.utils.cgm_intent import get_fast_answer
-                        fast_answer_type = intent_result.get("fast_answer")
-                        if fast_answer_type:
-                            # a. Special Case: Exit
-                            if fast_answer_type == "exit":
-                                self.logger.bind(tag=TAG).info(f"Exit intent recognized by LLM: {search_text}")
-                                handle_exit(self)
-                                return
-                            
-                            # b. Get Content to Speak
-                            fast_response = None
-                            
-                            # Give priority to programmatic answers for data-driven intents
-                            if fast_answer_type in ["time", "weather", "location"]:
-                                fast_response = get_fast_answer(fast_answer_type, client_id, self.config)
-                            
-                            # If no programmatic answer or it's a pure conversation intent, use LLM reply
-                            if not fast_response:
-                                fast_response = intent_result.get("reply")
-                            elif intent_result.get("reply"):
-                                # If we have both, we can optionally prefix (choosing to prefer the accurate data for now)
-                                self.logger.bind(tag=TAG).debug(f"Combined response: LLM says '{intent_result.get('reply')}', using data: '{fast_response}'")
-
-                            if fast_response:
-                                self.logger.bind(tag=TAG).info(f"Fast response ({fast_answer_type}): {fast_response}")
-                                self.sentence_id = str(uuid.uuid4().hex)
-                                # Wake up TTS with FIRST message
-                                self.tts.tts_text_queue.put(
-                                    TTSMessageDTO(
-                                        sentence_id=self.sentence_id,
-                                        sentence_type=SentenceType.FIRST,
-                                        content_type=ContentType.TEXT,
-                                        content_detail="",
-                                    )
+                    fast_answer_type = match_fast_intent(search_text) if client_id else None
+                    if fast_answer_type:
+                        fast_response = get_fast_answer(fast_answer_type, search_text, client_id, self.config)
+                        if fast_response:
+                            self.logger.bind(tag=TAG).info(f"Fast response ({fast_answer_type}): {fast_response}")
+                            self.sentence_id = str(uuid.uuid4().hex)
+                            # Wake up TTS with FIRST message
+                            self.tts.tts_text_queue.put(
+                                TTSMessageDTO(
+                                    sentence_id=self.sentence_id,
+                                    sentence_type=SentenceType.FIRST,
+                                    content_type=ContentType.TEXT,
+                                    content_detail="",
                                 )
-                                self.tts.tts_text_queue.put(
-                                    TTSMessageDTO(
-                                        sentence_id=self.sentence_id,
-                                        sentence_type=SentenceType.LAST,
-                                        content_type=ContentType.TEXT,
-                                        content_detail=fast_response,
-                                    )
+                            )
+                            self.tts.tts_text_queue.put(
+                                TTSMessageDTO(
+                                    sentence_id=self.sentence_id,
+                                    sentence_type=SentenceType.LAST,
+                                    content_type=ContentType.TEXT,
+                                    content_detail=fast_response,
                                 )
-                                self.dialogue.put(Message(role="user", content=search_text))
-                                self.dialogue.put(Message(role="assistant", content=fast_response))
-                                return
+                            )
+                            self.dialogue.put(Message(role="user", content=search_text))
+                            self.dialogue.put(Message(role="assistant", content=fast_response))
+                            return
                 except Exception as e:
                     self.logger.bind(tag=TAG).error(f"Fast answer check failed: {e}")
 
@@ -1292,108 +999,55 @@ class ConnectionHandler:
                     self.logger.bind(tag=TAG).error(f"Direct pump bolus lookup failed: {e}")
 
             try:
-                # Experimental: RAG Injection (using actual content)
+                # Context injection: history RAG + the current CGM reading (always, like time/date;
+                # the persona prompt decides when to mention it). Trends, pump analysis and web search
+                # are tools the main LLM calls when it needs them.
                 if depth == 0 and self.headers:
                     client_id = self.headers.get("client-id")
                     if client_id:
                         context_list = []
-                        
-                        # History RAG
+
                         hist_context = history_rag.search(search_text, client_id)
                         if hist_context:
                             self.logger.bind(tag=TAG).info(f"Injecting history RAG context for {client_id}")
                             context_list.append(hist_context)
 
-                        # CGM RAG from Config
-                        cgm_status_injected = False
-                        rag_config_path = os.path.join("data", client_id, "config.json")
-                        if os.path.exists(rag_config_path):
-                            with open(rag_config_path, "r") as f:
-                                c = json.load(f)
+                        from core.utils.cgm_manager import CGMManager, format_cgm_status, NO_DATA_NOTE
+                        client_cfg = {}
+                        client_cfg_path = os.path.join("data", client_id, "config.json")
+                        if os.path.exists(client_cfg_path):
+                            with open(client_cfg_path, "r") as f:
+                                client_cfg = json.load(f)
 
-                                # Use captured intent result (cached from start of chat)
-                                context_needs = intent_result
+                        if client_cfg.get("cgm"):
+                            # Refresh from Nightscout first if the local copy is older than 5 min.
+                            cgm_manager = CGMManager()
+                            stale_after = int(self.config.get("cgm_stale_after_minutes", 15))
 
-                                # CGM - Only for clients with "cgm" config object
-                                # Config format: {"cgm": {"api_secret": "...", "user_tz": "..."}}
-                                cgm_config = c.get("cgm")
-                                if cgm_config:
-                                    # Always include the current reading (like time/date); the prompt rules decide when to MENTION it.
-                                    # Refresh from Nightscout first if the local copy is older than 5 min.
-                                    from core.utils.cgm_manager import CGMManager, format_cgm_status
-                                    cgm_manager = CGMManager()
-                                    stale_after = int(self.config.get("cgm_stale_after_minutes", 15))
+                            cgm_state = cgm_manager.get_current_status(client_id, stale_after)
+                            if cgm_state["status"] == "no_data" or cgm_state["age_min"] > 5:
+                                self.logger.bind(tag=TAG).debug(f"CGM data missing or older than 5 min ({cgm_state['age_min']}), refreshing...")
+                                cgm_manager.fetch_and_update(client_id)
+                                cgm_state = cgm_manager.get_current_status(client_id, stale_after)
 
-                                    cgm_state = cgm_manager.get_current_status(client_id, stale_after)
-                                    if cgm_state["status"] == "no_data" or cgm_state["age_min"] > 5:
-                                        self.logger.bind(tag=TAG).debug(f"CGM data missing or older than 5 min ({cgm_state['age_min']}), refreshing...")
-                                        cgm_manager.fetch_and_update(client_id)
-                                        cgm_state = cgm_manager.get_current_status(client_id, stale_after)
-
-                                    if cgm_state["status"] == "ok" and (cgm_state["glucose"] < 70 or cgm_state["glucose"] > 250):
-                                        self.logger.bind(tag=TAG).warning(f"CGM critical: {cgm_state['glucose']} for {client_id}")
-                                    elif cgm_state["status"] != "ok":
-                                        self.logger.bind(tag=TAG).info(f"CGM {cgm_state['status']} for {client_id} (age_min={cgm_state['age_min']})")
-                                    context_list.append(format_cgm_status(cgm_state))
-                                    cgm_status_injected = True
-
-                                    # Full CGM context (trends, patterns) only if user asks
-                                    if context_needs.get("needs_cgm"):
-                                        cgm_summary = cgm_manager.get_context_summary(client_id)
-                                        if cgm_summary:
-                                            self.logger.bind(tag=TAG).info(f"Injecting full CGM context for {client_id}")
-                                            context_list.append(cgm_summary)
-                                
-                                # Pump/CGM Sync moved to before coach pipeline above
-                                pass
-
-                                if context_needs.get("needs_cgm") and context_needs.get("needs_pump"):
-                                    self.logger.bind(tag=TAG).info(
-                                        f"Joint diabetes reasoning requested for {client_id}: injecting both CGM and pump context"
-                                    )
-                                        
-                                # Web Search - One-shot factual grounding
-                                if context_needs.get("needs_search") and context_needs.get("search_query"):
-                                    search_query = context_needs.get("search_query")
-                                    self.logger.bind(tag=TAG).info(f"Triggering web search: {search_query}")
-                                    from core.utils.web_search import perform_web_search
-                                    search_results = perform_web_search(search_query, self.config)
-                                    if search_results:
-                                        # Truncate and wrap as a primary source
-                                        if len(search_results) > 2000:
-                                            search_results = search_results[:2000] + "... [truncated]"
-                                        
-                                        context_list.append(
-                                            f"--- WEB SEARCH DATA: {search_query} ---\n"
-                                            f"{search_results}\n"
-                                            f"--- END DATA ---\n"
-                                            f"IMPORTANT: Use the data above to answer the user now. Do not mention searching again."
-                                        )
-
-                                if not any([
-                                    context_needs.get("needs_cgm"),
-                                    context_needs.get("needs_pump"),
-                                    context_needs.get("needs_search"),
-                                ]):
-                                    self.logger.bind(tag=TAG).debug(f"Context classifier: no extra injection needed")
-
-                        # 用户问到血糖、但这个用户没有配置 CGM：明确告诉 LLM 暂无数据，避免它编一个读数
-                        if not cgm_status_injected and intent_result.get("needs_cgm"):
-                            from core.utils.cgm_manager import NO_DATA_NOTE
-                            self.logger.bind(tag=TAG).info(f"CGM requested but not configured for {client_id}: injecting no-data note")
+                            if cgm_state["status"] == "ok" and (cgm_state["glucose"] < 70 or cgm_state["glucose"] > 250):
+                                self.logger.bind(tag=TAG).warning(f"CGM critical: {cgm_state['glucose']} for {client_id}")
+                            elif cgm_state["status"] != "ok":
+                                self.logger.bind(tag=TAG).info(f"CGM {cgm_state['status']} for {client_id} (age_min={cgm_state['age_min']})")
+                            context_list.append(format_cgm_status(cgm_state))
+                        else:
+                            # 这个用户没有配置 CGM：明确告诉 LLM 暂无数据，避免它编一个读数
                             context_list.append(NO_DATA_NOTE)
 
-                        # Inject Context into Query
-                        if context_list:
-                            full_context = "\n".join(context_list)
-                            if is_json:
-                                json_data["content"] = f"{search_text}\n{full_context}"
-                                query = json.dumps(json_data, ensure_ascii=False)
-                            else:
-                                query = f"{search_text}\n{full_context}"
+                        full_context = "\n".join(context_list)
+                        if is_json:
+                            json_data["content"] = f"{search_text}\n{full_context}"
+                            query = json.dumps(json_data, ensure_ascii=False)
+                        else:
+                            query = f"{search_text}\n{full_context}"
 
             except Exception as e:
-                self.logger.bind(tag=TAG).error(f"RAG Injection failed: {e}")
+                self.logger.bind(tag=TAG).error(f"Context injection failed: {e}")
 
         # Create session ID and send FIRST request when at top level
         if depth == 0:
@@ -1441,69 +1095,10 @@ class ConnectionHandler:
                 and not force_final_answer
         ):
             functions = list(self.func_handler.get_functions())
-            # 仅在第一层调用时注入 direct_answer 虚拟工具
-            # 递归调用（depth>0）不注入，避免模型在生成文本回复时再次调 direct_answer 导致循环
-            if functions is not None and depth == 0:
-                functions.append(DIRECT_ANSWER_TOOL)
 
         response_message = []
 
         try:
-            # Layered diabetes-coach pipeline.
-            # Only run at top level for diabetes-related queries when layered prompts are available.
-            should_run_coach_pipeline = False
-            context_for_pipeline = intent_result if 'intent_result' in locals() else {}
-            if depth == 0 and self.pipeline_prompts and isinstance(context_for_pipeline, dict):
-                should_run_coach_pipeline = any([
-                    context_for_pipeline.get("needs_cgm"),
-                    context_for_pipeline.get("needs_pump"),
-                ])
-
-            # ON-DEMAND SYNC BEFORE COACH PIPELINE OR REGULAR CHAT
-            pump_summary = None
-            if isinstance(context_for_pipeline, dict):
-                client_id = self.client_id
-                if context_for_pipeline.get("needs_pump"):
-                    from core.utils.pump_manager import PumpManager
-                    pm = PumpManager()
-                    self.logger.bind(tag=TAG).info(f"Syncing pump data for {client_id} before response...")
-                    pm.fetch_and_update(client_id)
-                    pump_summary = pm.get_authoritative_summary(client_id)
-
-                if context_for_pipeline.get("needs_cgm"):
-                    from core.utils.cgm_manager import CGMManager
-                    cm = CGMManager()
-                    self.logger.bind(tag=TAG).info(f"Syncing CGM data for {client_id} before response...")
-                    cm.fetch_and_update(client_id)
-                    # CGM usually doesn't need an authoritative summary block in memory_str as it's less prone to "memory" confusion,
-                    # but we sync it here anyway for the coach pipeline to be fresh.
-
-            if should_run_coach_pipeline:
-                try:
-                    coach_reply = self.run_coach_pipeline(
-                        search_text,
-                        context_needs=context_for_pipeline,
-                    )
-                    if coach_reply:
-                        self.logger.bind(tag=TAG).info(f"Coach pipeline reply: {coach_reply}")
-
-                        self.dialogue.put(Message(role="assistant", content=coach_reply))
-
-                        self.tts.tts_text_queue.put(
-                            TTSMessageDTO(
-                                sentence_id=self.sentence_id,
-                                sentence_type=SentenceType.LAST,
-                                content_type=ContentType.TEXT,
-                                content_detail=coach_reply,
-                            )
-                        )
-                        self.llm_finish_task = True
-                        return None
-                except Exception as e:
-                    self.logger.bind(tag=TAG).error(f"Coach pipeline failed, falling back to legacy chat path: {e}")
-
-            # Use dialogue with memory
-            # Use dialogue with memory
             memory_str = None
 
             if self.memory is not None:
@@ -1511,31 +1106,18 @@ class ConnectionHandler:
                     self.memory.query_memory(query), self.loop
                 )
                 memory_str = future.result()
-                
-            # CRITICAL: Overwrite memory with authoritative pump data if available
-            if pump_summary:
-                authoritative_block = (
-                    "[CRITICAL: THE DATA BELOW IS REAL-TIME. DISREGARD ANY CONTRADICTING PUMP INFO IN THE MEMORY TAG BELOW.]\n"
-                    f"{pump_summary}\n"
-                    "[END REAL-TIME DATA]"
-                )
-                if memory_str:
-                    memory_str = f"{authoritative_block}\n\n{memory_str}"
-                else:
-                    memory_str = authoritative_block
 
-            else:
-                # Fallback: Try to load local summary.txt
-                try:
-                     c_id = self.headers.get("client-id") if self.headers else getattr(self, "device_id", None)
-                     if c_id:
-                         sum_path = os.path.join("data", c_id, "summary.txt")
-                         if os.path.exists(sum_path):
-                             with open(sum_path, "r", encoding="utf-8") as f:
-                                 memory_str = f.read().strip()
-                                 memory_str = self._filter_stale_realtime_summary_lines(memory_str)
-                except Exception as e:
-                     self.logger.bind(tag=TAG).warning(f"Failed to load local summary: {e}")
+            # Local summary.txt, if present, replaces the memory string
+            try:
+                 c_id = self.headers.get("client-id") if self.headers else getattr(self, "device_id", None)
+                 if c_id:
+                     sum_path = os.path.join("data", c_id, "summary.txt")
+                     if os.path.exists(sum_path):
+                         with open(sum_path, "r", encoding="utf-8") as f:
+                             memory_str = f.read().strip()
+                             memory_str = self._filter_stale_realtime_summary_lines(memory_str)
+            except Exception as e:
+                 self.logger.bind(tag=TAG).warning(f"Failed to load local summary: {e}")
 
 
             # 仅在该说话人首次出现时把身份注入 system，之后靠对话历史首轮保留，
@@ -1668,82 +1250,14 @@ class ConnectionHandler:
                         closing_index = buffer_stripped.find("@@", 2)
                         trigger_content = buffer_stripped[:closing_index+2]
                         
-                        # @@WEATHER@@
-                        if "@@WEATHER@@" in trigger_content:
-                            self.logger.bind(tag=TAG).info("Detected Stream Trigger: @@WEATHER@@")
-                            trigger_executed = True
-                            try:
-                                w_res = get_weather(self, location=None)
-                                w_text = w_res.response if w_res.response else w_res.result
-                                self.tts.tts_one_sentence(self, ContentType.TEXT, content_detail=w_text)
-                                response_message.append(w_text)
-                            except Exception as e:
-                                self.logger.bind(tag=TAG).error(f"Trigger execution failed: {e}")
-                        
                         # @@EXIT@@
-                        elif "@@EXIT@@" in trigger_content:
+                        if "@@EXIT@@" in trigger_content:
                             self.logger.bind(tag=TAG).info("Detected Stream Trigger: @@EXIT@@")
                             trigger_executed = True
                             self.close_after_chat = True
                             if not response_message:
                                 self.tts.tts_one_sentence(self, ContentType.TEXT, content_detail="Goodbye!")
                                 response_message.append("Goodbye!")
-
-                        # [TOOL_CALL] - Web Search
-                        elif "[TOOL_CALL]" in trigger_content:
-                            self.logger.bind(tag=TAG).info("Detected Stream Trigger: [TOOL_CALL]")
-                            trigger_executed = True
-                            try:
-                                # Extract JSON payload
-                                # Format: [TOOL_CALL] { "tool": "google_search", "args": { "query": "..." } }
-                                match = re.search(r"\[TOOL_CALL\]\s*(\{.*?\})", trigger_content)
-                                if match:
-                                    json_str = match.group(1)
-                                    tool_data = json.loads(json_str)
-                                    tool_name = tool_data.get("tool")
-                                    args = tool_data.get("args", {})
-                                    
-                                    if tool_name == "google_search":
-                                        query = args.get("query")
-                                        self.logger.bind(tag=TAG).info(f"Executing Web Search Tool: {query}")
-                                        
-                                        # Speak loading message
-                                        self.tts.tts_one_sentence(self, ContentType.TEXT, content_detail=f"Let me search specifically for {query}...")
-                                        
-                                        # Execute Search
-                                        from core.utils.web_search import perform_web_search
-                                        results = perform_web_search(query, self.config)
-                                        
-                                        if not results:
-                                            results = "No results found."
-                                        
-                                        # Truncate results
-                                        if len(results) > 2000:
-                                            results = results[:2000] + "... [truncated]"
-                                            
-                                        # RECURSIVE CALL: Feed results back to LLM
-                                        # We append the results as a "Function" or "System" message to history
-                                        # and call chat() again to get the final answer.
-                                        
-                                        search_context = (
-                                            f"--- WEB SEARCH RESULTS for '{query}' ---\n"
-                                            f"{results}\n"
-                                            f"--- END RESULTS ---\n"
-                                            f"Instructions: Use the search results above to answer the user's question directly. "
-                                            f"Do not mention the tool call or the search process again. Just give the answer."
-                                        )
-                                        
-                                        # Add to history
-                                        self.dialogue.put(Message(role="system", content=search_context))
-                                        
-                                        # Recurse!
-                                        # Important: Increment depth to prevent infinite loops logic (though we handle it)
-                                        self.chat(query="[System: results injected, please answer]", depth=depth+1)
-                                        return # End this level of recursion, the child call handles the rest
-                                        
-                            except Exception as e:
-                                self.logger.bind(tag=TAG).error(f"Tool execution failed: {e}")
-                                self.tts.tts_one_sentence(self, ContentType.TEXT, content_detail="I tried to search but something went wrong.")
 
                         else:
                             # Unknown tag
@@ -1879,54 +1393,6 @@ class ConnectionHandler:
                     self.dialogue.put(Message(role="assistant", content=text_buff))
                 response_message.clear()
 
-                # 分离 direct_answer 虚拟工具和真实工具调用
-                direct_answer_calls = [
-                    tc for tc in tool_calls_list if tc.get("name") == "direct_answer"
-                ]
-                real_tool_calls = [
-                    tc for tc in tool_calls_list if tc.get("name") != "direct_answer"
-                ]
-
-                if direct_answer_calls:
-                    self.logger.bind(tag=TAG).debug(
-                        f"模型选择 direct_answer，流式已播报，写入对话历史"
-                    )
-                    for tc in direct_answer_calls:
-                        da_response = self._extract_direct_answer_response(tc.get("arguments", "{}"))
-                        if da_response:
-                            # 刷新流式缓冲区中未发送的部分
-                            sent_len = tc.get("_da_sent", 0)
-                            remaining = da_response[sent_len:]
-                            if remaining:
-                                remaining = self._clean_response_garbage(remaining)
-                                if remaining:
-                                    self.tts.tts_text_queue.put(
-                                        TTSMessageDTO(
-                                            sentence_id=current_sentence_id,
-                                            sentence_type=SentenceType.MIDDLE,
-                                            content_type=ContentType.TEXT,
-                                            content_detail=remaining,
-                                        )
-                                    )
-                            # 写入对话历史
-                            da_response = self._clean_response_garbage(da_response)
-                            self.tts.store_tts_text(current_sentence_id, da_response)
-                            self.dialogue.put(Message(role="assistant", content=da_response))
-
-                    if not real_tool_calls:
-                        if depth == 0:
-                            self.tts.tts_text_queue.put(
-                                TTSMessageDTO(
-                                    sentence_id=current_sentence_id,
-                                    sentence_type=SentenceType.LAST,
-                                    content_type=ContentType.ACTION,
-                                )
-                            )
-                        return
-
-                    tool_calls_list = real_tool_calls
-
-            if not bHasError and len(tool_calls_list) > 0:
                 self.logger.bind(tag=TAG).debug(
                     f"Detected {len(tool_calls_list)} tool calls"
                 )
@@ -1969,20 +1435,20 @@ class ConnectionHandler:
             # Send full LLM text to client for on-screen display.
             # This arrives while TTS audio is still being synthesized/played,
             # allowing the device to show the complete response text immediately.
-            if depth == 0:
-                try:
-                    display_text = textUtils.check_emoji(text_buff)
-                    asyncio.run_coroutine_threadsafe(
-                        self.websocket.send(json.dumps({
-                            "type": "tts",
-                            "state": "sentence_start",
-                            "text": display_text,
-                            "session_id": self.session_id,
-                        })),
-                        self.loop,
-                    )
-                except Exception as e:
-                    self.logger.bind(tag=TAG).warning(f"Failed to send LLM text to client: {e}")
+            # Sent at every depth: after a tool call the answer comes from the depth+1 call.
+            try:
+                display_text = textUtils.check_emoji(text_buff)
+                asyncio.run_coroutine_threadsafe(
+                    self.websocket.send(json.dumps({
+                        "type": "tts",
+                        "state": "sentence_start",
+                        "text": display_text,
+                        "session_id": self.session_id,
+                    })),
+                    self.loop,
+                )
+            except Exception as e:
+                self.logger.bind(tag=TAG).warning(f"Failed to send LLM text to client: {e}")
 
         if depth == 0:
             self.tts.tts_text_queue.put(
@@ -2511,61 +1977,6 @@ class ConnectionHandler:
             self.logger.bind(tag=TAG).error(f"Timeout check task error: {e}")
         finally:
             self.logger.bind(tag=TAG).info("Timeout check task exited")
-
-    @staticmethod
-    def _extract_direct_answer_response(arguments_str):
-        """从 direct_answer 的参数中提取 response 值。
-        优先使用 json.loads 标准解析，流式阶段 fallback 到字符串提取。
-        """
-        if not arguments_str:
-            return ""
-        # 优先尝试标准 JSON 解析（适用于完整且格式正确的 JSON）
-        try:
-            data = json.loads(arguments_str)
-            if isinstance(data, dict) and "response" in data:
-                return data["response"]
-        except (json.JSONDecodeError, TypeError):
-            pass
-        # Fallback：流式阶段 JSON 可能不完整，使用字符串提取
-        marker = '"response": "'
-        idx = arguments_str.find(marker)
-        if idx < 0:
-            marker = '"response":"'
-            idx = arguments_str.find(marker)
-        if idx < 0:
-            return ""
-        start = idx + len(marker)
-        raw = arguments_str[start:]
-        # 去掉末尾的 JSON 闭合符号（如果已完整）
-        if raw.endswith('"}'):
-            raw = raw[:-2]
-        elif raw.endswith('"'):
-            raw = raw[:-1]
-        # 处理 JSON 转义
-        raw = raw.replace('\\"', '"').replace('\\n', '\n').replace('\\\\', '\\')
-        return raw
-
-    @staticmethod
-    def _clean_response_garbage(text):
-        """清理 response 中可能泄漏的 JSON 闭合符号。
-        模型有时会在 response 内容中生成 JSON 闭合字符（如 ）"}} 或 '})，
-        这些不是故事内容的一部分，需要去除。
-        """
-        if not text:
-            return text
-        # 清理独立一行的 JSON 闭合垃圾（如 ）"}}  '}}  "}}  }}  } ）
-        _garbage_chars = frozenset('")\'}）')
-        lines = text.split('\n')
-        cleaned = []
-        for line in lines:
-            stripped = line.strip()
-            if stripped and len(stripped) <= 8 and all(c in _garbage_chars for c in stripped):
-                continue
-            cleaned.append(line)
-        result = '\n'.join(cleaned)
-        # 清理末尾残留的 JSON 闭合符号
-        result = re.sub(r'["\'}\]]+$', '', result.rstrip()).rstrip()
-        return result
 
     def _merge_tool_calls(self, tool_calls_list, tools_call):
         """Merge tool call list

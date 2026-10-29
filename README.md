@@ -8,7 +8,7 @@ server 基于开源项目 [xiaozhi-esp32-server](https://github.com/xinnan-tech/
 
 | 目录 | 内容 |
 |---|---|
-| `server/` | Python WebSocket server（端口 8000，路径 `/xiaozhi/v1/`）：ASR → 意图分类 → 注入 CGM/泵/搜索/历史上下文 → LLM 三层 prompt（decision → interpretation → persona） |
+| `server/` | Python WebSocket server（端口 8000，路径 `/xiaozhi/v1/`）：ASR → 规则快速回答（时间/天气/地点）→ 注入当前血糖和历史上下文 → 主 LLM（persona）按需调用工具：`get_diabetes_data`（内部跑 decision → interpretation）、`web_search` |
 | `client/` | 浏览器客户端：纯 HTML + 原生 JS，加一个 `serve.py`（静态页 + Gemini TTS 接口，端口 5173）。详见 [client/README.md](client/README.md)，协议见 [client/PROTOCOL.md](client/PROTOCOL.md) |
 | `analysis/` | 离线 CGM 统计脚本（日、周、月的 TIR / CV / GMI、高低血糖事件），研究用，不依赖 server |
 
@@ -16,8 +16,9 @@ T1D 相关的核心代码：
 
 | 文件 | 作用 |
 |---|---|
-| `server/core/connection.py` | 每个连接的主流程：意图路由、上下文注入、三层 prompt、会话记忆 |
-| `server/core/utils/cgm_intent.py` | 意图分类器：判断要不要 CGM、泵、网络搜索，以及时间、天气、地点、退出的快速回答 |
+| `server/core/connection.py` | 每个连接的主流程：规则快速回答、上下文注入、工具调用、会话记忆 |
+| `server/core/utils/fast_intent.py` | 规则匹配时间、天气、地点问题，直接回答，不调用 LLM |
+| `server/core/utils/coach_pipeline.py`、`server/plugins_func/functions/get_diabetes_data.py` | `get_diabetes_data` 工具：同步 Nightscout，构建 CGM/泵分析，跑 decision → interpretation，把结果交给主 LLM 按 persona 回答 |
 | `server/core/utils/cgm_manager.py` | 每 15 分钟从 Nightscout 拉取血糖，计算 TIR/TAR/TBR/GMI |
 | `server/core/utils/pump_manager.py` | 拉取泵事件和 profile，分析 bolus 效果与异常 |
 | `server/core/utils/prompt_manager.py` | 加载三层 prompt，支持按 client-id 覆盖 |
@@ -32,7 +33,6 @@ T1D 相关的核心代码：
 
 ```bash
 ollama serve                 # 保持运行
-ollama pull qwen2.5:3b       # 意图分类用（本地）
 ```
 
 主 LLM 在 `server/config.yaml` 的 `LLM.openai.model_name`，目前是 `gemma4:31b-cloud`（Ollama **云端**模型）。
@@ -97,7 +97,7 @@ python -m cgm_analyze.daily_summary   # 日期写在各脚本的 main() 里
 | 环节 | 去向 |
 |---|---|
 | 语音识别 | 本地 FunASR，不离开本机 |
-| 意图分类 | 本地 `qwen2.5:3b`，不离开本机 |
+| 时间/天气/地点快速回答 | 本地规则，不调用 LLM |
 | 回复生成 | Ollama 云端 `gemma4:31b-cloud`：persona、CGM/泵数据、对话内容都会发出去。改成本地模型才能全本地 |
 | 朗读 | `cloud_first` 发给 Google Gemini TTS；`local_only` 用浏览器自带语音 |
-| 网络搜索 | 意图分类判断需要时，查询词发给 DuckDuckGo |
+| 网络搜索 | 主 LLM 调用 `web_search` 工具时，查询词发给 DuckDuckGo |

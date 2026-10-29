@@ -26,18 +26,16 @@
   - Similar to existing `get_battery_level` pattern
   - Server can query when relevant to conversation
 
-- [ ] Reduce classifier latency
-  - Currently 4-7 seconds per call
-  - Consider smaller model for intent detection
-  - Or run classifier in parallel with other processing
 
 ## Architecture Notes
-- Context classifier: `core/utils/cgm_intent.py`
-- Context injection: `core/connection.py` (lines ~930-1000)
+- Fast answers (time / weather / location, rule-based): `core/utils/fast_intent.py`
+- Context injection (history RAG + current CGM reading): `core/connection.py` `chat()`
+- Tools the main LLM can call: `config.yaml` `Intent.function_call.functions`
+  - `get_diabetes_data` -> `core/utils/coach_pipeline.py` (analysis -> decision -> interpretation)
 - Client configs: `data/<client-id>/config.json`
-- Persona prompts: `data/<client-id>/prompt.txt`
+- Persona prompts: `data/<client-id>/prompts/prompt_persona.txt` (or `prompt.txt`)
 
 To add a new context type:
-1. Update classifier prompt in `cgm_intent.py`
-2. Add injection logic in `connection.py`
+1. Register a tool in `plugins_func/functions/` (`@register_function`)
+2. Add it to `Intent.function_call.functions` in `config.yaml`
 3. (Optional) Add config flag in client's `config.json`
