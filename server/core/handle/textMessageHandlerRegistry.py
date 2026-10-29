@@ -6,6 +6,7 @@ from core.handle.textHandler.listenMessageHandler import ListenTextMessageHandle
 from core.handle.textMessageHandler import TextMessageHandler
 from core.handle.textHandler.serverMessageHandler import ServerTextMessageHandler
 from core.handle.textHandler.pingMessageHandler import PingMessageHandler
+from core.handle.textHandler.statusMessageHandler import StatusMessageHandler
 
 TAG = __name__
 
@@ -25,6 +26,7 @@ class TextMessageHandlerRegistry:
             ListenTextMessageHandler(),
             ServerTextMessageHandler(),
             PingMessageHandler(),
+            StatusMessageHandler(),
         ]
 
         for handler in handlers:

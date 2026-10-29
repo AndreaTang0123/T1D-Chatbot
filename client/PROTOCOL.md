@@ -163,6 +163,35 @@ stt(text) → tts start → llm(emoji) → tts sentence_start(全文) → tts se
 （2026-09-23 本机实测：短回复时“全文”那条先于逐句那条到达，两者先后不固定）
 ```
 
+### 本项目新增的消息（2026-10-28，浏览器 UI 用）
+
+**status**（血糖胶囊 / Today 面板）
+
+- 客户端 → server：`{"type":"status"}`。web-client 在 hello 完成后、每 60 秒（页面在前台时）、页面回到前台时、每次收到 coach evidence 后各发一次。
+- server → 客户端：同名消息，由 `S/core/utils/status_snapshot.py` 生成。处理器 `S/core/handle/textHandler/statusMessageHandler.py` 用 `create_task` 异步发送，不挡住同一连接上随后的 listen 和音频帧。
+
+```json
+{
+  "type": "status", "server_time": 1793237196,
+  "cgm": { "enabled": true, "status": "ok|stale|no_data", "glucose": 143, "direction": "Flat",
+           "age_min": 2, "unix_s": 1793237144, "stale_after_min": 15,
+           "today":  { "n": 259, "mean": 167, "tir": 73.0, "tbr": 0.0, "tar": 27.0, "min": 80, "max": 291, "cv": 35.8 },
+           "days14": { "...同上": "", "gmi": 6.7, "days": 3 } },
+  "pump": { "enabled": true, "status": "ok|stale|no_data", "latest_event_date": "2026-10-28", "age_hours": 1.3,
+            "stale_after_hours": 6, "last_bolus": { "unix_s": 1793230123, "insulin_units": 0.16, "carbs_g": null } }
+}
+```
+
+- `today` 从用户时区（config.json 的 `cgm.user_tz`）的 0 点算起；没有读数时为 `null`。客户端没有配置 CGM / pump 时对应段只有 `{"enabled": false}`。
+- 读数超过 5 分钟时会顺手从 Nightscout 补拉一次（每个 client 最多每分钟一次），因为后台任务 15 分钟才拉一次。
+- 只读 CSV，不调用 LLM，也不写对话记忆。
+
+**coach**（get_diabetes_data 的进度和数据依据，server → 客户端）
+
+- `{"type":"coach","state":"step","step":"data|decision|interpretation","topic":"glucose|insulin|both"}`：每一步开始时发送。
+- `{"type":"coach","state":"evidence","topic":...,"cgm":{...},"pump":{...},"decision":{...}}`：工具结束、主模型生成回复之前发送，内容是本次交给模型的 `analysis_result` 子集和 `decision_result`（见 `S/plugins_func/functions/get_diabetes_data.py` 的 `build_evidence`）。
+- 顺序：`stt(text) → tts start → coach step × 1~3 → coach evidence → llm → tts sentence_start … → tts stop`。web-client 把 evidence 挂到本轮的助手气泡下面。
+
 ---
 
 ## 5. TTS 实际采样率（核对结果）

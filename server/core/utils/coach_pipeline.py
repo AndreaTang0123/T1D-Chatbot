@@ -8,7 +8,7 @@ longer a separate call here.
 import json
 import os
 import uuid
-from typing import Any, Dict, TYPE_CHECKING
+from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
 
 from config.logger import setup_logging
 from core.utils.dialogue import Dialogue, Message
@@ -162,8 +162,19 @@ def build_analysis_result(conn: "ConnectionHandler", query: str, topic: str) -> 
     return result
 
 
-def run_insight_pipeline(conn: "ConnectionHandler", query: str, topic: str) -> Dict[str, Any]:
-    """analysis -> decision -> interpretation. Returns what the persona layer needs."""
+def run_insight_pipeline(
+    conn: "ConnectionHandler",
+    query: str,
+    topic: str,
+    on_step: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
+    """analysis -> decision -> interpretation. Returns what the persona layer needs.
+
+    on_step("data" / "decision" / "interpretation") 在每一步开始时调用，给浏览器显示进度。
+    """
+    notify = on_step or (lambda step: None)
+
+    notify("data")
     analysis_result = build_analysis_result(conn, query, topic)
 
     prompts = conn.pipeline_prompts or {}
@@ -173,7 +184,9 @@ def run_insight_pipeline(conn: "ConnectionHandler", query: str, topic: str) -> D
         # 这个用户没有分层 prompt：直接把结构化数据交给主模型
         return {"analysis_result": analysis_result}
 
+    notify("decision")
     decision_result = safe_parse_json(llm_single_shot(conn, decision_prompt, analysis_result))
+    notify("interpretation")
     insight_text = llm_single_shot(
         conn,
         interpretation_prompt,

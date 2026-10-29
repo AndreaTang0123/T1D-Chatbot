@@ -8,3 +8,4 @@ class TextMessageType(Enum):
     LISTEN = "listen"
     SERVER = "server"
     PING = "ping"
+    STATUS = "status"

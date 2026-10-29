@@ -18,6 +18,19 @@
       --ok: #1f9d55;
       --warn: #d69e2e;
       --err: #d64545;
+      /* 血糖区间色：低 / 目标内 / 偏高 / 很高 / 过期 */
+      --g-low: #d64545;
+      --g-ok: #1f9d55;
+      --g-high: #e07b12;
+      --g-vhigh: #c2410c;
+      --g-stale: #8a8f98;
+      --tint-low: rgba(214, 69, 69, 0.12);
+      --tint-ok: rgba(31, 157, 85, 0.12);
+      --tint-high: rgba(224, 123, 18, 0.14);
+      --tint-vhigh: rgba(194, 65, 12, 0.14);
+      --tint-stale: rgba(138, 143, 152, 0.14);
+      --chip: rgba(47, 111, 237, 0.10);
+      --shadow: 0 8px 30px rgba(0, 0, 0, 0.12);
     }
     @media (prefers-color-scheme: dark) {
       :root {
@@ -28,6 +41,18 @@
         --user: #3b7cf5;
         --bot: #25272b;
         --border: #33363b;
+        --g-low: #f06b6b;
+        --g-ok: #3fbf74;
+        --g-high: #f59e3b;
+        --g-vhigh: #fb7a3c;
+        --g-stale: #8a8f98;
+        --tint-low: rgba(240, 107, 107, 0.18);
+        --tint-ok: rgba(63, 191, 116, 0.16);
+        --tint-high: rgba(245, 158, 59, 0.18);
+        --tint-vhigh: rgba(251, 122, 60, 0.18);
+        --tint-stale: rgba(138, 143, 152, 0.18);
+        --chip: rgba(59, 124, 245, 0.20);
+        --shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
       }
     }
     * { box-sizing: border-box; }
@@ -40,6 +65,9 @@
       flex-direction: column;
       height: 100dvh;
     }
+    button { font: inherit; color: inherit; }
+
+    /* ---------- 顶栏 ---------- */
     header {
       display: flex;
       align-items: center;
@@ -48,84 +76,216 @@
       background: var(--panel);
       border-bottom: 1px solid var(--border);
     }
-    header h1 { font-size: 17px; margin: 0; flex: 1; }
+    .avatar {
+      width: 36px; height: 36px; border-radius: 50%;
+      flex: none;
+      display: grid; place-items: center;
+      background: linear-gradient(135deg, #5b8cff, #7a5cf0);
+      color: #fff; font-weight: 700; font-size: 16px;
+    }
+    .avatar.small { width: 28px; height: 28px; font-size: 13px; }
+    .title { flex: 1; min-width: 0; }
+    header h1 { font-size: 17px; margin: 0; line-height: 1.2; }
+    .subline {
+      display: flex; align-items: center; gap: 6px;
+      font-size: 12px; color: var(--muted);
+      white-space: nowrap; overflow: hidden;
+    }
     #statusDot {
-      width: 12px; height: 12px; border-radius: 50%;
+      width: 8px; height: 8px; border-radius: 50%;
       background: var(--err);
       flex: none;
     }
     #statusDot.connecting { background: var(--warn); }
     #statusDot.ready { background: var(--ok); }
-    #statusText { font-size: 13px; color: var(--muted); }
     #voiceLabel {
-      font-size: 12px;
-      color: var(--muted);
-      padding: 2px 8px;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      padding: 0 6px;
       border: 1px solid var(--border);
-      border-radius: 10px;
-      white-space: nowrap;
+      border-radius: 8px;
     }
     #voiceLabel:empty { display: none; }
     #reconnectBtn {
-      font: inherit; font-size: 14px;
+      font-size: 14px;
       padding: 4px 10px;
       border: 1px solid var(--border);
       border-radius: 8px;
       background: transparent;
-      color: var(--text);
     }
     #reconnectBtn[hidden] { display: none; }
+
+    /* 血糖胶囊：点开 Today 面板 */
+    #glucosePill {
+      display: flex; align-items: center; gap: 8px;
+      padding: 5px 12px 5px 10px;
+      border: 0; border-radius: 999px;
+      background: var(--tint-stale);
+      color: var(--g-stale);
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+    }
+    #glucosePill[hidden] { display: none; }
+    .pill-value { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1; }
+    .pill-arrow { font-size: 18px; font-weight: 700; line-height: 1; }
+    .pill-meta { display: flex; flex-direction: column; align-items: flex-start; font-size: 10px; line-height: 1.2; opacity: 0.85; }
+    .g-low { --g: var(--g-low); --tint: var(--tint-low); }
+    .g-ok { --g: var(--g-ok); --tint: var(--tint-ok); }
+    .g-high { --g: var(--g-high); --tint: var(--tint-high); }
+    .g-vhigh { --g: var(--g-vhigh); --tint: var(--tint-vhigh); }
+    .g-stale, .g-none { --g: var(--g-stale); --tint: var(--tint-stale); }
+    #glucosePill[class*="g-"] { background: var(--tint); color: var(--g); }
+    #glucosePill.g-low { animation: pulse 1.6s ease-in-out infinite; }
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 0 0 0 var(--tint-low); }
+      50% { box-shadow: 0 0 0 6px var(--tint-low); }
+    }
+
+    /* ---------- 消息 ---------- */
     #messages {
       flex: 1;
       overflow-y: auto;
       padding: 16px;
       display: flex;
       flex-direction: column;
-      gap: 10px;
+      gap: 12px;
       -webkit-overflow-scrolling: touch;
     }
+    .row { display: flex; gap: 8px; align-items: flex-end; max-width: 100%; }
+    .row.user { justify-content: flex-end; }
+    .row .col { display: flex; flex-direction: column; min-width: 0; max-width: 82%; }
+    .row.user .col { align-items: flex-end; }
+    .row.bot .col { align-items: flex-start; }
+    .row.bot .avatar { align-self: flex-start; }
     .bubble {
-      max-width: 82%;
       padding: 9px 13px;
-      border-radius: 16px;
+      border-radius: 18px;
       white-space: pre-wrap;
       word-break: break-word;
+      animation: rise 160ms ease-out;
     }
+    @keyframes rise { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
     .bubble.user {
-      align-self: flex-end;
       background: var(--user);
       color: var(--user-text);
-      border-bottom-right-radius: 4px;
+      border-bottom-right-radius: 6px;
     }
     .bubble.bot {
-      align-self: flex-start;
       background: var(--bot);
       border: 1px solid var(--border);
-      border-bottom-left-radius: 4px;
+      border-top-left-radius: 6px;
     }
-    .notice {
-      align-self: center;
-      font-size: 12px;
+    .meta { font-size: 11px; color: var(--muted); margin: 3px 6px 0; }
+
+    /* 回复里的数值标签 */
+    .chip {
+      display: inline-block;
+      padding: 0 6px;
+      border-radius: 6px;
+      background: var(--chip);
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .bubble.user .chip { background: rgba(255, 255, 255, 0.22); }
+    .chip[class*="g-"] { background: var(--tint); color: var(--g); }
+
+    /* 思考中 */
+    .bubble.typing { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 14px; }
+    .dots { display: inline-flex; gap: 4px; }
+    .dots i {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--muted);
+      animation: blink 1.2s infinite ease-in-out;
+    }
+    .dots i:nth-child(2) { animation-delay: 0.15s; }
+    .dots i:nth-child(3) { animation-delay: 0.3s; }
+    @keyframes blink { 0%, 80%, 100% { opacity: 0.25; } 40% { opacity: 1; } }
+
+    .notice { align-self: center; font-size: 12px; color: var(--muted); text-align: center; }
+
+    /* 开场建议 */
+    .starters { margin-top: 4px; }
+    .starters .asks { justify-content: center; }
+    .ask {
+      padding: 7px 12px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--panel);
+      font-size: 14px;
+      cursor: pointer;
+    }
+    .ask:disabled { opacity: 0.5; }
+
+    /* 数据依据 */
+    details.evidence {
+      margin-top: 6px;
+      max-width: 100%;
+      font-size: 13px;
       color: var(--muted);
     }
+    details.evidence summary {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+      cursor: pointer;
+      list-style: none;
+      padding: 2px 4px;
+    }
+    details.evidence summary::-webkit-details-marker { display: none; }
+    details.evidence summary::before { content: "▸"; font-size: 11px; transition: transform 120ms; }
+    details.evidence[open] summary::before { transform: rotate(90deg); }
+    .badge {
+      display: inline-block;
+      padding: 1px 7px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+      background: var(--tint-stale);
+      color: var(--g-stale);
+    }
+    .badge.ok { background: var(--tint-ok); color: var(--g-ok); }
+    .badge.warn { background: var(--tint-high); color: var(--g-high); }
+    .badge.bad { background: var(--tint-low); color: var(--g-low); }
+    .ev-body {
+      margin-top: 6px;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--panel);
+      color: var(--text);
+    }
+    .ev-body h4 { margin: 10px 0 4px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+    .ev-body h4:first-child { margin-top: 0; }
+    .ev-body ul { margin: 0; padding-left: 18px; }
+    .ev-body li { margin: 2px 0; }
+    .ev-body p { margin: 2px 0; }
+    .ev-focus { font-weight: 600; }
+    .ev-raw { white-space: pre-wrap; font-size: 12px; color: var(--muted); }
+
+    /* ---------- 底部：状态行 + 按住说话 + 输入 ---------- */
     #talkBar {
       display: flex;
-      justify-content: center;
-      padding: 12px 16px 4px;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 16px 4px;
       background: var(--panel);
       border-top: 1px solid var(--border);
     }
-    /* 按住说话：禁止长按选中/菜单/双击缩放，按下时变红，外圈随音量扩散 */
+    #phase { min-height: 18px; font-size: 13px; color: var(--muted); }
+    #phase.active { color: var(--user); font-weight: 600; }
+    #phase.recording { color: var(--err); font-weight: 600; }
+    /* 按住说话：禁止长按选中/菜单/双击缩放，按下时变红，音量条随音量跳动 */
     #talkBtn {
       --level: 0;
+      display: flex; align-items: center; justify-content: center; gap: 12px;
       width: 100%;
       max-width: 420px;
-      height: 72px;
+      height: 64px;
       border: 0;
-      border-radius: 36px;
+      border-radius: 32px;
       background: var(--user);
       color: #fff;
-      font: inherit;
       font-size: 18px;
       font-weight: 600;
       user-select: none;
@@ -133,15 +293,27 @@
       -webkit-touch-callout: none;
       -webkit-tap-highlight-color: transparent;
       touch-action: none;
-      box-shadow: 0 0 0 calc(var(--level) * 16px) rgba(47, 111, 237, 0.25);
-      transition: box-shadow 60ms linear, transform 80ms ease, background 80ms ease;
+      box-shadow: 0 0 0 calc(var(--level) * 14px) rgba(47, 111, 237, 0.22);
+      transition: box-shadow 60ms linear, transform 80ms ease, background 120ms ease;
     }
     #talkBtn.recording {
       background: var(--err);
       transform: scale(0.98);
-      box-shadow: 0 0 0 calc(var(--level) * 16px) rgba(214, 69, 69, 0.3);
+      box-shadow: 0 0 0 calc(var(--level) * 14px) rgba(214, 69, 69, 0.28);
     }
+    #talkBtn.speaking { background: linear-gradient(90deg, var(--user), #7a5cf0); }
     #talkBtn:disabled { opacity: 0.4; }
+    .bars { display: none; align-items: center; gap: 3px; height: 28px; }
+    #talkBtn.recording .bars { display: inline-flex; }
+    .bars i {
+      width: 4px; border-radius: 2px; background: #fff;
+      height: calc(4px + var(--level) * var(--k) * 24px);
+      transition: height 60ms linear;
+    }
+    .bars i:nth-child(1), .bars i:nth-child(5) { --k: 0.45; }
+    .bars i:nth-child(2), .bars i:nth-child(4) { --k: 0.8; }
+    .bars i:nth-child(3) { --k: 1; }
+
     form {
       display: flex;
       gap: 8px;
@@ -154,44 +326,131 @@
       min-width: 0;
       font: inherit;
       font-size: 16px;
-      padding: 10px 12px;
+      padding: 10px 14px;
       border: 1px solid var(--border);
       border-radius: 20px;
       background: var(--bg);
       color: var(--text);
     }
     #sendBtn {
-      font: inherit;
       padding: 0 18px;
       border: 0;
       border-radius: 20px;
       background: var(--user);
       color: #fff;
+      font-weight: 600;
     }
     #sendBtn:disabled { opacity: 0.4; }
+
+    /* ---------- Today 面板（底部弹出） ---------- */
+    #sheetBackdrop {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.35);
+      opacity: 0; transition: opacity 180ms ease;
+      z-index: 10;
+    }
+    #sheetBackdrop.open { opacity: 1; }
+    #todaySheet {
+      position: fixed; left: 0; right: 0; bottom: 0;
+      max-height: 88dvh;
+      overflow-y: auto;
+      margin: 0 auto;
+      max-width: 560px;
+      padding: 8px 16px calc(20px + env(safe-area-inset-bottom));
+      background: var(--panel);
+      border-radius: 20px 20px 0 0;
+      box-shadow: var(--shadow);
+      transform: translateY(100%);
+      transition: transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+      z-index: 11;
+    }
+    #todaySheet.open { transform: none; }
+    #sheetBackdrop[hidden], #todaySheet[hidden] { display: none; }
+    .sheet-handle { width: 40px; height: 5px; border-radius: 3px; background: var(--border); margin: 0 auto 8px; }
+    .sheet-head { display: flex; align-items: center; justify-content: space-between; }
+    .sheet-head h2 { margin: 0; font-size: 20px; }
+    #sheetClose { border: 0; background: transparent; color: var(--user); font-weight: 600; padding: 6px 4px; }
+    #todayBody h3 {
+      display: flex; align-items: baseline; gap: 8px;
+      margin: 18px 0 8px; font-size: 15px;
+    }
+    #todayBody h3 small { font-weight: 400; color: var(--muted); font-size: 12px; }
+    .now {
+      margin-top: 10px;
+      padding: 16px;
+      border-radius: 16px;
+      background: var(--tint);
+      color: var(--g);
+    }
+    .now-value { font-size: 44px; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; }
+    .now-value .arrow { font-size: 32px; margin-left: 6px; }
+    .now-sub { margin-top: 6px; font-size: 14px; opacity: 0.9; }
+    .tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .tile { padding: 10px 12px; border: 1px solid var(--border); border-radius: 14px; }
+    .tile-label { font-size: 12px; color: var(--muted); }
+    .tile-value { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .tile-value small { font-size: 12px; font-weight: 500; color: var(--muted); margin-left: 2px; }
+    .tile-goal { font-size: 11px; color: var(--muted); }
+    .tile.good .tile-value { color: var(--g-ok); }
+    .tile.bad .tile-value { color: var(--g-high); }
+    .list-row { display: flex; justify-content: space-between; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 14px; }
+    .list-row:last-child { border-bottom: 0; }
+    .list-row span:first-child { color: var(--muted); }
+    .foot { margin: 8px 0 0; font-size: 12px; color: var(--muted); }
+    .asks { display: flex; flex-wrap: wrap; gap: 8px; }
+    .empty { color: var(--muted); font-size: 14px; }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation: none !important; transition: none !important; }
+    }
   </style>
 </head>
 <body>
   <header>
-    <span id="statusDot"></span>
-    <h1>T1D Chat</h1>
-    <span id="voiceLabel"></span>
-    <span id="statusText">Disconnected</span>
+    <div class="avatar" aria-hidden="true">J</div>
+    <div class="title">
+      <h1>Joe</h1>
+      <div class="subline">
+        <span id="statusDot"></span>
+        <span id="statusText">Disconnected</span>
+        <span id="voiceLabel"></span>
+      </div>
+    </div>
     <button id="reconnectBtn" type="button" hidden>Reconnect</button>
+    <button id="glucosePill" type="button" class="g-none" aria-haspopup="dialog" aria-label="Glucose: no data. Open today's summary" hidden>
+      <span class="pill-value">--</span>
+      <span class="pill-arrow"></span>
+      <span class="pill-meta"><span>mg/dL</span><span class="pill-age">No data</span></span>
+    </button>
   </header>
 
   <main id="messages">
     <div class="notice">Replies are generated by a cloud LLM (Ollama gemma4:31b-cloud)</div>
+    <div class="starters" id="starters"></div>
   </main>
 
   <div id="talkBar">
-    <button id="talkBtn" type="button" disabled>Hold to talk</button>
+    <div id="phase" aria-live="polite"></div>
+    <button id="talkBtn" type="button" disabled>
+      <span class="bars" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+      <span id="talkLabel">Hold to talk</span>
+    </button>
   </div>
 
   <form id="inputForm" autocomplete="off">
-    <input id="textInput" type="text" placeholder="Type a message…" enterkeyhint="send">
+    <input id="textInput" type="text" placeholder="Message Joe…" enterkeyhint="send">
     <button id="sendBtn" type="submit" disabled>Send</button>
   </form>
+
+  <div id="sheetBackdrop" hidden></div>
+  <section id="todaySheet" role="dialog" aria-modal="true" aria-labelledby="todayTitle" hidden>
+    <div class="sheet-handle"></div>
+    <div class="sheet-head">
+      <h2 id="todayTitle">Today</h2>
+      <button id="sheetClose" type="button">Done</button>
+    </div>
+    <div id="todayBody"></div>
+  </section>
 
   <!-- 与 server 仓库 test/js/utils/libopus.js 相同（asm.js 构建，同步初始化，导出 Module.instance） -->
   <script src="libopus.js"></script>

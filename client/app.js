@@ -53,6 +53,8 @@ const $send = document.getElementById('sendBtn');
 const $dot = document.getElementById('statusDot');
 const $statusText = document.getElementById('statusText');
 const $reconnect = document.getElementById('reconnectBtn');
+const $phase = document.getElementById('phase');
+const $starters = document.getElementById('starters');
 
 // state: 'disconnected' | 'connecting' | 'ready'
 function setStatus(state, text) {
@@ -60,6 +62,7 @@ function setStatus(state, text) {
   $statusText.textContent = text;
   $send.disabled = state !== 'ready';
   $reconnect.hidden = state !== 'disconnected';
+  document.querySelectorAll('.ask').forEach((b) => { b.disabled = state !== 'ready'; });
   updateTalkButton();
 }
 
@@ -67,21 +70,114 @@ function scrollToBottom() {
   $messages.scrollTop = $messages.scrollHeight;
 }
 
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text != null) node.textContent = text;
+  return node;
+}
+
+function clockTime(date) {
+  return (date || new Date()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+// 一条消息 = row > [头像] + col > bubble + meta（时间）+ 可选的数据依据
 function addBubble(role, text) {
-  const el = document.createElement('div');
-  el.className = 'bubble ' + role;
-  el.textContent = text;
-  $messages.appendChild(el);
+  const row = el('div', 'row ' + role);
+  if (role === 'bot') row.appendChild(el('div', 'avatar small', 'J'));
+  const col = el('div', 'col');
+  const bubble = el('div', 'bubble ' + role);
+  renderRich(bubble, text);
+  col.appendChild(bubble);
+  col.appendChild(el('div', 'meta', clockTime()));
+  row.appendChild(col);
+  $messages.appendChild(row);
+  if (role === 'user') $starters.remove();
   scrollToBottom();
-  return el;
+  return bubble;
 }
 
 function addNotice(text) {
-  const el = document.createElement('div');
-  el.className = 'notice';
-  el.textContent = text;
-  $messages.appendChild(el);
+  $messages.appendChild(el('div', 'notice', text));
   scrollToBottom();
+}
+
+// ---------- 数值高亮 ----------
+// 回复里的 "143 mg/dL"、"72%"、"1.5 U" 做成小标签；血糖值按区间上色。
+// 只生成文本节点和 span，不用 innerHTML（回复来自 LLM）。
+
+const VALUE_RE = /(\d+(?:\.\d+)?)\s?(mg\/dL|mmol\/L|%|units?\b|U\b)/gi;
+// "decreased by 38 mg/dL"、"a drop of 40 mg/dL"、"+25 mg/dL" 是变化量，不是血糖值，不按区间上色
+const DELTA_BEFORE_RE = /(\bby|\bof|[+\-−±])\s*$/i;
+
+// mg/dL：<70 低，70-180 目标内，181-250 偏高，>250 很高
+function glucoseClass(mgdl) {
+  if (mgdl == null || isNaN(mgdl)) return 'g-none';
+  if (mgdl < 70) return 'g-low';
+  if (mgdl <= 180) return 'g-ok';
+  if (mgdl <= 250) return 'g-high';
+  return 'g-vhigh';
+}
+
+function renderRich(node, text) {
+  node.replaceChildren();
+  let last = 0;
+  for (const m of text.matchAll(VALUE_RE)) {
+    if (m.index > last) node.appendChild(document.createTextNode(text.slice(last, m.index)));
+    const chip = el('span', 'chip', m[0]);
+    const unit = m[2].toLowerCase();
+    const isDelta = DELTA_BEFORE_RE.test(text.slice(Math.max(0, m.index - 12), m.index));
+    if (isDelta) { /* 变化量：保持中性标签 */ }
+    else if (unit === 'mg/dl') chip.classList.add(glucoseClass(parseFloat(m[1])));
+    else if (unit === 'mmol/l') chip.classList.add(glucoseClass(parseFloat(m[1]) * 18));
+    node.appendChild(chip);
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) node.appendChild(document.createTextNode(text.slice(last)));
+}
+
+// ---------- 思考中 ----------
+// stt（用户这句话）到达后显示，第一句回复或 tts stop 时移除；
+// get_diabetes_data 运行时 server 推送 coach step，标签随之变化。
+
+const STEP_LABELS = {
+  data: 'Syncing your CGM & pump data…',
+  decision: 'Looking for patterns…',
+  interpretation: 'Putting it into words…',
+};
+
+let typingRow = null;
+let waitingReply = false;  // 已收到用户这句话（stt），回复还没开始
+let transcribing = false;  // 已松开按钮，还没收到 stt
+let transcribeTimer = null;
+
+function showTyping(label) {
+  waitingReply = true;
+  if (!typingRow) {
+    typingRow = el('div', 'row bot');
+    typingRow.appendChild(el('div', 'avatar small', 'J'));
+    const bubble = el('div', 'bubble bot typing');
+    const dots = el('span', 'dots');
+    dots.append(el('i'), el('i'), el('i'));
+    bubble.append(dots, el('span', 'typing-label'));
+    typingRow.appendChild(bubble);
+  }
+  typingRow.querySelector('.typing-label').textContent = label || 'Thinking…';
+  $messages.appendChild(typingRow); // 已在页面里时会移到最后
+  scrollToBottom();
+}
+
+function hideTyping() {
+  waitingReply = false;
+  if (typingRow) typingRow.remove();
+  typingRow = null;
+}
+
+function setTranscribing(on) {
+  transcribing = on;
+  clearTimeout(transcribeTimer);
+  // 没识别出文字时 server 什么都不回，10s 后放弃等待
+  if (on) transcribeTimer = setTimeout(() => { transcribing = false; }, 10000);
 }
 
 // ---------- 助手回复合并 ----------
@@ -95,10 +191,12 @@ function normalize(s) {
 
 let botBubble = null; // 本轮的助手气泡
 let botText = '';
+let pendingEvidence = null; // 本轮 get_diabetes_data 的数据依据，等气泡出现后挂上去
 
 function resetTurn() {
   botBubble = null;
   botText = '';
+  pendingEvidence = null;
 }
 
 function onAssistantText(text) {
@@ -117,10 +215,338 @@ function onAssistantText(text) {
     botText = botText ? botText + ' ' + text : text;
   }
 
+  hideTyping();
   if (!botBubble) botBubble = addBubble('bot', botText);
-  else botBubble.textContent = botText;
+  else renderRich(botBubble, botText);
+  attachEvidence();
   scrollToBottom();
 }
+
+function attachEvidence() {
+  if (!pendingEvidence || !botBubble) return;
+  botBubble.parentElement.appendChild(renderEvidence(pendingEvidence));
+  pendingEvidence = null;
+}
+
+// ---------- 数据依据 ----------
+// 只展示本次真正交给模型的数据（server 的 get_diabetes_data → build_evidence）。
+
+const DIRECTION_ARROWS = {
+  DoubleUp: '⇈', SingleUp: '↑', FortyFiveUp: '↗', Flat: '→',
+  FortyFiveDown: '↘', SingleDown: '↓', DoubleDown: '⇊',
+};
+const DIRECTION_WORDS = {
+  DoubleUp: 'rising fast', SingleUp: 'rising', FortyFiveUp: 'rising slowly', Flat: 'steady',
+  FortyFiveDown: 'falling slowly', SingleDown: 'falling', DoubleDown: 'falling fast',
+};
+
+function cgmBadge(status, ageMin) {
+  if (status === 'ok') return el('span', 'badge ok', 'CGM live' + (ageMin != null ? ' · ' + ageMin + ' min' : ''));
+  if (status === 'stale') return el('span', 'badge warn', 'CGM ' + formatAge(ageMin * 60) + ' old');
+  return el('span', 'badge bad', 'No CGM data');
+}
+
+function pumpBadge(ds) {
+  if (!ds || !ds.status || ds.status === 'no_data') return el('span', 'badge', 'No pump data');
+  if (ds.status === 'ok') return el('span', 'badge ok', 'Pump synced');
+  return el('span', 'badge warn', 'Pump ' + formatAge(ds.age_hours * 3600) + ' old');
+}
+
+const OVERALL_CLASSES = { stable: 'ok', 'needs attention': 'warn', 'high risk': 'bad' };
+
+function renderEvidence(ev) {
+  const details = el('details', 'evidence');
+  const summary = el('summary');
+  summary.appendChild(el('span', null, 'Data behind this answer'));
+  const decision = ev.decision || {};
+  if (decision.overall_status) {
+    summary.appendChild(el('span', 'badge ' + (OVERALL_CLASSES[decision.overall_status] || ''), decision.overall_status));
+  }
+  summary.appendChild(cgmBadge(ev.cgm.status, ev.cgm.age_min));
+  if (ev.topic !== 'glucose') summary.appendChild(pumpBadge(ev.pump.data_status));
+  details.appendChild(summary);
+
+  const body = el('div', 'ev-body');
+  const section = (title) => body.appendChild(el('h4', null, title));
+  const list = (items) => {
+    const ul = el('ul');
+    for (const item of items) {
+      const li = el('li');
+      renderRich(li, String(item));
+      ul.appendChild(li);
+    }
+    body.appendChild(ul);
+  };
+  const para = (text, cls) => {
+    const p = el('p', cls);
+    renderRich(p, text);
+    body.appendChild(p);
+  };
+
+  if (decision.focus_message || (decision.primary_issues || []).length) {
+    section("Joe's read");
+    if (decision.focus_message) para(decision.focus_message, 'ev-focus');
+    const issues = [].concat(decision.primary_issues || [], decision.secondary_issues || []);
+    if (issues.length) list(issues);
+    const pats = [].concat(decision.patterns || [], decision.pump_context || []);
+    if (pats.length) list(pats);
+  }
+
+  section('Glucose');
+  const cgm = ev.cgm;
+  if (cgm.status === 'ok') {
+    para(cgm.glucose_now + ' mg/dL, ' + (DIRECTION_WORDS[cgm.direction] || cgm.direction || '') + ', ' + cgm.age_min + ' min ago');
+  } else if (cgm.status === 'stale') {
+    para('No current reading. Last was ' + cgm.last_glucose + ' mg/dL, ' + formatAge(cgm.age_min * 60) + ' ago.');
+  } else {
+    para('No CGM reading available.');
+  }
+  // patterns.daily 是 "[CGM Data]\n当前读数\n规律 + TIR" 这样的文本块，去掉标题和重复的当前读数行
+  const lines = [];
+  for (const block of cgm.context || []) {
+    for (const line of String(block).split('\n')) {
+      const t = line.trim();
+      if (t && !/^\[CGM Data\]$/.test(t) && !/^Current Glucose:/.test(t)) lines.push(t);
+    }
+  }
+  const metrics = Object.entries(cgm.metrics || {}).map(([k, v]) => k + ': ' + (typeof v === 'object' ? JSON.stringify(v) : v));
+  if (lines.length || metrics.length) list(lines.concat(metrics));
+
+  const pump = ev.pump;
+  const pumpItems = [].concat(pump.patterns || [], pump.insulin_effect || [], pump.anomalies || []);
+  if (ev.topic !== 'glucose' && (pumpItems.length || pump.summary)) {
+    section('Pump & insulin');
+    if (pumpItems.length) list(pumpItems);
+    if (pump.summary) {
+      const raw = el('details');
+      raw.appendChild(el('summary', null, 'Raw pump summary'));
+      raw.appendChild(el('p', 'ev-raw', pump.summary));
+      body.appendChild(raw);
+    }
+  }
+
+  details.appendChild(body);
+  details.addEventListener('toggle', () => { if (details.open) details.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); });
+  return details;
+}
+
+// ---------- 血糖胶囊 + Today 面板 ----------
+// 数据来自 {"type":"status"} 的回复（server/core/utils/status_snapshot.py）。
+// 连上后、每分钟、页面回到前台、每次数据分析后各请求一次；读数年龄在本地按收到时间往后推。
+
+const STATUS_POLL_MS = 60000;
+const $pill = document.getElementById('glucosePill');
+const $sheet = document.getElementById('todaySheet');
+const $backdrop = document.getElementById('sheetBackdrop');
+const $todayBody = document.getElementById('todayBody');
+
+let lastStatus = null;
+let statusReceivedAt = 0;
+
+function requestStatus() {
+  if (sessionId) sendJson({ type: 'status' });
+}
+
+function onStatus(msg) {
+  lastStatus = msg;
+  statusReceivedAt = Date.now();
+  renderPill();
+  if (!$sheet.hidden) renderToday();
+}
+
+// 秒 → "3 min" / "2 h 5 min" / "3 d"
+function formatAge(seconds) {
+  const min = Math.max(0, Math.round(seconds / 60));
+  if (min < 60) return min + ' min';
+  const h = Math.floor(min / 60);
+  if (h < 48) return h + ' h' + (min % 60 && h < 6 ? ' ' + (min % 60) + ' min' : '');
+  return Math.floor(h / 24) + ' d';
+}
+
+// 当前 CGM 读数的实时状态（年龄按收到快照后经过的时间推算）
+function liveCgm() {
+  const cgm = lastStatus && lastStatus.cgm;
+  if (!cgm || !cgm.enabled) return null;
+  if (cgm.glucose == null || cgm.age_min == null) return { cgm, state: 'none' };
+  const ageMin = cgm.age_min + Math.floor((Date.now() - statusReceivedAt) / 60000);
+  const stale = ageMin > (cgm.stale_after_min || 15);
+  return { cgm, ageMin, state: stale ? 'stale' : 'ok' };
+}
+
+function renderPill() {
+  const live = liveCgm();
+  $pill.hidden = !live;
+  if (!live) return;
+  const value = $pill.querySelector('.pill-value');
+  const arrow = $pill.querySelector('.pill-arrow');
+  const age = $pill.querySelector('.pill-age');
+  if (live.state === 'none') {
+    $pill.className = 'g-none';
+    value.textContent = '--';
+    arrow.textContent = '';
+    age.textContent = 'No data';
+    $pill.setAttribute('aria-label', "No CGM reading. Open today's summary");
+    return;
+  }
+  const { cgm, ageMin } = live;
+  $pill.className = live.state === 'stale' ? 'g-stale' : glucoseClass(cgm.glucose);
+  value.textContent = cgm.glucose;
+  arrow.textContent = live.state === 'stale' ? '' : (DIRECTION_ARROWS[cgm.direction] || '');
+  age.textContent = ageMin < 1 ? 'just now' : formatAge(ageMin * 60) + ' ago';
+  $pill.setAttribute('aria-label', 'Glucose ' + cgm.glucose + ' mg/dL, ' +
+    (DIRECTION_WORDS[cgm.direction] || '') + ', ' + age.textContent + ". Open today's summary");
+}
+
+// 目标值来自国际 CGM 共识（Battelino 2019）
+function tile(label, value, unit, goal, good) {
+  const t = el('div', 'tile' + (good == null ? '' : good ? ' good' : ' bad'));
+  t.appendChild(el('div', 'tile-label', label));
+  const v = el('div', 'tile-value', value == null ? '--' : String(value));
+  if (unit && value != null) v.appendChild(el('small', null, unit));
+  t.appendChild(v);
+  if (goal) t.appendChild(el('div', 'tile-goal', goal));
+  return t;
+}
+
+function rangeTiles(s, extra) {
+  const tiles = el('div', 'tiles');
+  tiles.append(
+    tile('In range 70–180', s.tir, '%', 'goal > 70%', s.tir >= 70),
+    tile('Average', s.mean, 'mg/dL', null, null),
+    tile('Below 70', s.tbr, '%', 'goal < 4%', s.tbr < 4),
+    tile('Above 180', s.tar, '%', 'goal < 25%', s.tar < 25),
+  );
+  if (extra) tiles.append(...extra);
+  return tiles;
+}
+
+function listRow(label, value) {
+  const row = el('div', 'list-row');
+  row.append(el('span', null, label), el('span', null, value));
+  return row;
+}
+
+const QUICK_ASKS = [
+  'How has my glucose been today?',
+  'Any patterns in the last two weeks?',
+  'Did my last bolus work?',
+];
+
+function askButtons(className) {
+  const wrap = el('div', className);
+  for (const q of QUICK_ASKS) {
+    const b = el('button', 'ask', q);
+    b.type = 'button';
+    b.disabled = !sessionId;
+    b.addEventListener('click', () => {
+      unlockAudio();
+      if (sendText(q)) closeToday();
+    });
+    wrap.appendChild(b);
+  }
+  return wrap;
+}
+
+function renderToday() {
+  const body = $todayBody;
+  body.replaceChildren();
+  if (!lastStatus) {
+    body.appendChild(el('p', 'empty', sessionId ? 'Loading…' : 'Not connected.'));
+    return;
+  }
+
+  const live = liveCgm();
+  if (!live) {
+    body.appendChild(el('p', 'empty', 'No CGM is connected for this account.'));
+  } else {
+    const now = el('div', 'now ' + (live.state === 'ok' ? glucoseClass(live.cgm.glucose) : 'g-stale'));
+    const value = el('div', 'now-value', live.state === 'none' ? '--' : String(live.cgm.glucose));
+    if (live.state === 'ok') value.appendChild(el('span', 'arrow', DIRECTION_ARROWS[live.cgm.direction] || ''));
+    now.appendChild(value);
+    let sub = 'No reading available';
+    if (live.state === 'ok') {
+      sub = 'mg/dL · ' + (DIRECTION_WORDS[live.cgm.direction] || live.cgm.direction) + ' · ' +
+        (live.ageMin < 1 ? 'just now' : formatAge(live.ageMin * 60) + ' ago');
+    } else if (live.state === 'stale') {
+      sub = 'Last reading ' + formatAge(live.ageMin * 60) + ' ago, not current';
+    }
+    now.appendChild(el('div', 'now-sub', sub));
+    body.appendChild(now);
+
+    const today = live.cgm.today;
+    body.appendChild(el('h3', null, 'Today so far'));
+    if (today) {
+      body.appendChild(rangeTiles(today));
+      body.appendChild(el('p', 'foot', 'Lowest ' + today.min + ' · Highest ' + today.max + ' · ' + today.n + ' readings'));
+    } else {
+      body.appendChild(el('p', 'empty', 'No readings since midnight.'));
+    }
+
+    const d14 = live.cgm.days14;
+    const h14 = el('h3', null, 'Last 14 days');
+    if (d14) h14.appendChild(el('small', null, d14.days + (d14.days === 1 ? ' day' : ' days') + ' of data'));
+    body.appendChild(h14);
+    if (d14) {
+      body.appendChild(rangeTiles(d14, [
+        tile('GMI', d14.gmi, '%', 'goal < 7%', d14.gmi < 7),
+        tile('Variability (CV)', d14.cv, '%', 'goal ≤ 36%', d14.cv == null ? null : d14.cv <= 36),
+      ]));
+    } else {
+      body.appendChild(el('p', 'empty', 'No readings in the last 14 days.'));
+    }
+  }
+
+  const pump = lastStatus.pump;
+  if (pump && pump.enabled) {
+    body.appendChild(el('h3', null, 'Pump'));
+    const nowS = lastStatus.server_time + (Date.now() - statusReceivedAt) / 1000;
+    const b = pump.last_bolus;
+    if (b) {
+      let text = (b.insulin_units != null ? b.insulin_units + ' U' : 'Bolus');
+      if (b.carbs_g) text += ' · ' + b.carbs_g + ' g carbs';
+      text += ' · ' + formatAge(nowS - b.unix_s) + ' ago';
+      body.appendChild(listRow('Last bolus', text));
+    }
+    const sync = el('span');
+    sync.appendChild(pumpBadge(pump));
+    const row = el('div', 'list-row');
+    row.append(el('span', null, 'Pump data'), sync);
+    body.appendChild(row);
+  }
+
+  body.appendChild(el('h3', null, 'Ask Joe'));
+  body.appendChild(askButtons('asks'));
+  body.appendChild(el('p', 'foot', 'Updated ' + clockTime(new Date(statusReceivedAt)) + ' · not medical advice'));
+}
+
+function openToday() {
+  renderToday();
+  requestStatus();
+  $backdrop.hidden = false;
+  $sheet.hidden = false;
+  // 先显示再加 class，transition 才会生效
+  requestAnimationFrame(() => {
+    $backdrop.classList.add('open');
+    $sheet.classList.add('open');
+  });
+  document.getElementById('sheetClose').focus();
+}
+
+function closeToday() {
+  if ($sheet.hidden) return;
+  $backdrop.classList.remove('open');
+  $sheet.classList.remove('open');
+  setTimeout(() => {
+    $backdrop.hidden = true;
+    $sheet.hidden = true;
+  }, 220);
+  $pill.focus();
+}
+
+$pill.addEventListener('click', openToday);
+$backdrop.addEventListener('click', closeToday);
+document.getElementById('sheetClose').addEventListener('click', closeToday);
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeToday(); });
 
 // ---------- Opus 解码 ----------
 // libopus.js 是 asm.js 构建，堆固定 16MB 且不可增长，所以输入/输出缓冲只分配一次。
@@ -446,6 +872,8 @@ function connect() {
     serverSpeaking = false;
     dropStaleAudio = false;
     resetTurn();
+    hideTyping();
+    setTranscribing(false);
     cancelRecording('socket closed');
     stopAllAudio();
     setStatus('disconnected', 'Disconnected');
@@ -496,6 +924,7 @@ function handleText(raw) {
       sessionId = msg.session_id;
       console.log('[ws] hello ok, session_id=' + sessionId + ' audio_params=' + JSON.stringify(msg.audio_params));
       setStatus('ready', 'Connected');
+      requestStatus();
       break;
 
     case 'stt':
@@ -503,8 +932,25 @@ function handleText(raw) {
       if (msg.text) {
         TTSPlayer.stop();
         resetTurn();
+        setTranscribing(false);
         addBubble('user', msg.text);
+        showTyping();
       }
+      break;
+
+    case 'coach':
+      // get_diabetes_data 的进度和数据依据（server/plugins_func/functions/get_diabetes_data.py）
+      if (msg.state === 'step') {
+        showTyping(STEP_LABELS[msg.step]);
+      } else if (msg.state === 'evidence') {
+        pendingEvidence = msg;
+        attachEvidence();
+        requestStatus(); // 分析前刚同步过 Nightscout
+      }
+      break;
+
+    case 'status':
+      onStatus(msg);
       break;
 
     case 'tts':
@@ -516,6 +962,7 @@ function handleText(raw) {
       } else if (msg.state === 'stop') {
         console.log('[ws] tts stop, turn finished');
         serverSpeaking = false;
+        hideTyping();
         resetPlaybackQueue();
         // 所有 sentence_start（含全文）都先于 stop 到达，此时 botText 是完整回复
         if (botText) TTSPlayer.speak(botText);
@@ -553,14 +1000,33 @@ let awaitingStop = false;  // 已松开，等 worklet 发完最后一帧
 let stopFallbackTimer = null;
 let recStats = null;
 
+const $talkLabel = document.getElementById('talkLabel');
+
 function updateTalkButton() {
   const ready = !!sessionId;
   $talk.disabled = !ready;
   $talk.classList.toggle('recording', recording);
-  if (micState === 'initializing') $talk.textContent = 'Enabling mic…';
-  else if (recording) $talk.textContent = 'Release to send';
-  else $talk.textContent = 'Hold to talk';
+  if (micState === 'initializing') $talkLabel.textContent = 'Enabling mic…';
+  else if (recording) $talkLabel.textContent = 'Release to send';
+  else $talkLabel.textContent = 'Hold to talk';
   if (!recording) $talk.style.setProperty('--level', '0');
+  updatePhase();
+}
+
+// 按钮上方的一行状态：录音 / 识别 / 思考 / 播报 / 空闲提示
+function updatePhase() {
+  let text = '';
+  let cls = '';
+  const speaking = !!sessionId && !recording && isBotSpeaking();
+  if (!sessionId) text = '';
+  else if (recording) { text = 'Listening…'; cls = 'recording'; }
+  else if (awaitingStop || transcribing) { text = 'Got it, transcribing…'; cls = 'active'; }
+  else if (waitingReply) { text = 'Joe is thinking…'; cls = 'active'; }
+  else if (speaking) { text = 'Joe is speaking · hold to interrupt'; cls = 'active'; }
+  else text = 'Hold the button and speak, or type below';
+  if ($phase.textContent !== text) $phase.textContent = text;
+  $phase.className = cls;
+  $talk.classList.toggle('speaking', speaking);
 }
 
 async function initMic() {
@@ -677,6 +1143,8 @@ function finishRecording() {
       ' peak=' + s.peak.toFixed(3) + ' held=' + ((performance.now() - s.t0) / 1000).toFixed(2) + 's');
     if (s.frames < MIN_FRAMES) addNotice('Too short — hold the button while you speak');
     else if (s.peak < 0.01) addNotice('No sound picked up — check the microphone');
+    else setTranscribing(true);
+    updatePhase();
   }, STOP_DELAY_MS);
 }
 
@@ -743,15 +1211,17 @@ document.addEventListener('visibilitychange', () => { if (document.hidden) press
 
 // ---------- 输入 ----------
 
+// 文字输入、开场建议和 Today 面板的快捷提问都走这里；用户气泡等 server 回 stt 再显示
+function sendText(text) {
+  if (!text || !sessionId) return false;
+  return sendJson({ type: 'listen', mode: 'manual', state: 'detect', text: text });
+}
+
 $form.addEventListener('submit', (e) => {
   e.preventDefault();
   // 发送按钮/键盘回车是用户手势，在这里解锁音频（iOS 要求）
   unlockAudio();
-  const text = $input.value.trim();
-  if (!text || !sessionId) return;
-  if (sendJson({ type: 'listen', mode: 'manual', state: 'detect', text: text })) {
-    $input.value = '';
-  }
+  if (sendText($input.value.trim())) $input.value = '';
 });
 
 $reconnect.addEventListener('click', () => {
@@ -763,6 +1233,13 @@ $reconnect.addEventListener('click', () => {
 // 首次点击页面任意位置也解锁 TTS（iOS 要求首次发声在用户手势里）
 document.addEventListener('touchend', () => TTSPlayer.unlock(), { once: true });
 document.addEventListener('click', () => TTSPlayer.unlock(), { once: true });
+
+// 状态行跟随 TTS 播放（本地播放结束没有事件，轮询）；胶囊上的「几分钟前」每 30s 刷新
+setInterval(updatePhase, 300);
+setInterval(renderPill, 30000);
+setInterval(() => { if (!document.hidden) requestStatus(); }, STATUS_POLL_MS);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) requestStatus(); });
+$starters.appendChild(askButtons('asks'));
 
 TTSPlayer.init();
 console.log('[ws] device-id=' + deviceId + ' client-id=' + clientId + (clientId === JOE_CLIENT_ID ? ' (Joe)' : ' (override)'));
