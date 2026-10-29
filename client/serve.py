@@ -154,6 +154,18 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, f.read(), entry[1])
 
     def do_POST(self):
+        if self.path.split("?", 1)[0] == "/api/debug-log":
+            # 页面带 ?debug=1 时把 console.log 转发过来，方便看 iPhone 上的日志；只写本机日志
+            try:
+                length = min(int(self.headers.get("Content-Length", "0")), 64 * 1024)
+                lines = json.loads(self.rfile.read(length) or b"[]")
+            except (ValueError, json.JSONDecodeError):
+                self._json(400, {"error": "bad_request"})
+                return
+            for line in lines[:200]:
+                log.info("[client] %s", str(line)[:500])
+            self._json(200, {"ok": True})
+            return
         if self.path.split("?", 1)[0] != "/api/tts":
             self._send(404, b"not found", "text/plain")
             return

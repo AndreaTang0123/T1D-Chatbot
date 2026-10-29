@@ -70,7 +70,9 @@ const TTSPlayer = (() => {
     }
     const update = () => {
       voices = speechSynthesis.getVoices();
-      console.log('[tts] voices loaded: ' + voices.length);
+      console.log('[tts] voices loaded: ' + voices.length + ' en=' + voices
+        .filter((v) => v.lang && v.lang.toLowerCase().startsWith('en'))
+        .map((v) => v.name + (isQuality(v) ? '*' : '')).join(','));
     };
     update();
     speechSynthesis.addEventListener('voiceschanged', update);
@@ -97,20 +99,63 @@ const TTSPlayer = (() => {
     return /google/i.test(v.name) || v.localService === false;
   }
 
+  // Apple 的特效声音和 Eloquence 复古声音：不适合 Joe，列表和自动选择里都去掉
+  const NOVELTY_NAMES = new Set(['albert', 'bad news', 'bahh', 'bells', 'boing', 'bubbles', 'cellos', 'deranged',
+    'fred', 'good news', 'hysterical', 'jester', 'junior', 'kathy', 'organ', 'pipe organ', 'princess', 'ralph',
+    'superstar', 'trinoids', 'whisper', 'wobble', 'zarvox']);
+  const RETRO_NAMES = new Set(['eddy', 'flo', 'grandma', 'grandpa', 'reed', 'rocko', 'sandy', 'shelley']);
+
+  function isNoveltyVoice(v) {
+    const base = v.name.toLowerCase().replace(/\s*\(.*\)\s*$/, '').trim(); // 去掉 "(English (US))" 之类后缀
+    return NOVELTY_NAMES.has(base) || RETRO_NAMES.has(base) || /eloquence/i.test(v.voiceURI || '');
+  }
+
+  function usableVoices(prefix) {
+    return voices.filter((v) => v.lang && v.lang.toLowerCase().startsWith(prefix) && !isNetworkVoice(v) && !isNoveltyVoice(v));
+  }
+
+  // iOS 上增强/高级声音的 name 不一定带后缀，但 voiceURI 形如 com.apple.voice.enhanced.en-US.Allison
   function isQuality(v) {
-    return /premium|enhanced|高级|优化/i.test(v.name);
+    return /premium|enhanced|高级|优化/i.test(v.name + ' ' + (v.voiceURI || ''));
   }
 
   const PREFERRED = {
-    en: [/^Ava\b.*premium/i, /^Zoe\b.*premium/i, /^Evan\b.*enhanced/i],
+    en: [/^Allison\b/i, /^Ava\b.*premium/i, /^Zoe\b.*premium/i, /^Evan\b.*enhanced/i],
     zh: [/(tingting|婷婷).*(premium|enhanced|高级|优化)/i, /(meijia|美佳).*(premium|enhanced|高级|优化)/i],
   };
 
+  // ?voice=名字 可以临时指定声音（只匹配名字开头，不区分大小写）
+  const VOICE_OVERRIDE = (new URLSearchParams(location.search).get('voice') || '').trim().toLowerCase();
+
+  // 用户在声音标签的下拉框里选的声音（按语言各存一个 voiceURI），只存在本机浏览器
+  const VOICE_KEY = 't1d.voice.';
+  const chosenNow = {}; // 本页面内的选择；localStorage 不可用时也能生效
+
+  function savedVoice(prefix) {
+    if (prefix in chosenNow) return chosenNow[prefix];
+    try {
+      return localStorage.getItem(VOICE_KEY + prefix) || '';
+    } catch (e) {
+      return '';
+    }
+  }
+
   function pickVoice(lang) {
     const prefix = lang === 'zh' ? 'zh' : 'en';
-    const local = voices.filter((v) => v.lang && v.lang.toLowerCase().startsWith(prefix) && !isNetworkVoice(v));
+    const local = usableVoices(prefix);
+    const chosen = savedVoice(prefix);
+    if (chosen) {
+      const v = local.find((x) => x.voiceURI === chosen);
+      if (v) return v;
+    }
+    if (VOICE_OVERRIDE) {
+      const v = local.find((x) => x.name.toLowerCase().startsWith(VOICE_OVERRIDE));
+      if (v) return v;
+    }
+    // 同名声音（如 Allison 普通版和增强版）优先取增强/高级版
+    const byQuality = local.filter(isQuality).concat(local.filter((v) => !isQuality(v)));
     for (const re of PREFERRED[lang]) {
-      const v = local.find((x) => re.test(x.name));
+      const v = byQuality.find((x) => re.test(x.name));
       if (v) return v;
     }
     const zhCN = (v) => v.lang.toLowerCase().replace('_', '-') === 'zh-cn';
@@ -144,7 +189,12 @@ const TTSPlayer = (() => {
       } else {
         u.lang = lang === 'zh' ? 'zh-CN' : 'en-US';
       }
-      u.onend = () => resolve();
+      u.onstart = () => console.log('[tts] browser utterance started, audioSession=' +
+        (navigator.audioSession ? navigator.audioSession.type : 'n/a'));
+      u.onend = () => {
+        console.log('[tts] browser utterance ended');
+        resolve();
+      };
       u.onerror = (e) => {
         console.log('[tts] browser utterance error', e.error);
         resolve();
@@ -335,6 +385,61 @@ const TTSPlayer = (() => {
       speechSynthesis.speak(u);
       console.log('[tts] speechSynthesis unlocked');
     }
+  }
+
+  // ---------- 声音选择 ----------
+  // 选项在每次点开前重建：iOS 的声音列表可能在页面打开后才加载完
+
+  const $select = document.getElementById('voiceSelect');
+
+  function voiceLabel(v) {
+    return v.name + (isQuality(v) ? ' ★' : '') + ' · ' + v.lang;
+  }
+
+  function fillPicker() {
+    if (!$select || !window.speechSynthesis) return;
+    voices = speechSynthesis.getVoices();
+    $select.textContent = '';
+    for (const prefix of ['en', 'zh']) {
+      const list = usableVoices(prefix)
+        .sort((a, b) => (isQuality(b) - isQuality(a)) || a.name.localeCompare(b.name));
+      const group = document.createElement('optgroup');
+      group.label = prefix === 'en' ? 'English' : '中文';
+      const auto = document.createElement('option');
+      auto.value = prefix + '|';
+      auto.textContent = prefix === 'en' ? 'Auto (English)' : '自动（中文）';
+      group.appendChild(auto);
+      for (const v of list) {
+        const o = document.createElement('option');
+        o.value = prefix + '|' + v.voiceURI;
+        o.textContent = voiceLabel(v);
+        group.appendChild(o);
+      }
+      $select.appendChild(group);
+    }
+    const current = pickVoice('en');
+    $select.value = 'en|' + (savedVoice('en') && current ? current.voiceURI : '');
+    console.log('[tts] picker voices en=' + voices.filter((v) => v.lang && v.lang.toLowerCase().startsWith('en'))
+      .map((v) => v.name + (isQuality(v) ? '*' : '') + '<' + v.voiceURI + '>').join(','));
+  }
+
+  if ($select) {
+    $select.addEventListener('pointerdown', fillPicker);
+    $select.addEventListener('focus', fillPicker);
+    $select.addEventListener('change', () => {
+      const [prefix, uri] = $select.value.split('|');
+      chosenNow[prefix] = uri;
+      try {
+        if (uri) localStorage.setItem(VOICE_KEY + prefix, uri);
+        else localStorage.removeItem(VOICE_KEY + prefix);
+      } catch (e) {
+        // 隐私模式等拿不到 localStorage：只在本页面内生效
+      }
+      const v = pickVoice(prefix);
+      console.log('[tts] voice chosen: ' + (v ? v.name + ' <' + v.voiceURI + '>' : 'auto'));
+      // 在用户手势里试读一句，顺便解锁 iOS 的朗读
+      speak(prefix === 'zh' ? '你好，我是 Joe。' : "Hi, I'm Joe. This is how I'll sound.");
+    });
   }
 
   return { init, unlock, speak, stop, isSpeaking };

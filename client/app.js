@@ -3,6 +3,24 @@
 
 'use strict';
 
+// ?debug=1：把 console.log 和报错转发到 serve.py 的日志里，方便排查 iPhone 上的问题
+if (new URLSearchParams(location.search).get('debug') === '1') {
+  const buf = [];
+  const origLog = console.log.bind(console);
+  const push = (args) => buf.push(new Date().toISOString().slice(11, 23) + ' ' +
+    args.map((a) => (a instanceof Error ? a.name + ': ' + a.message : typeof a === 'object' ? (() => { try { return JSON.stringify(a); } catch (e) { return String(a); } })() : String(a))).join(' '));
+  console.log = (...args) => { origLog(...args); push(args); };
+  window.addEventListener('error', (e) => push(['[error]', e.message]));
+  window.addEventListener('unhandledrejection', (e) => push(['[rejection]', e.reason]));
+  push(['[debug] ua=' + navigator.userAgent + ' audioSession=' + (navigator.audioSession ? navigator.audioSession.type : 'n/a') +
+    ' speechSynthesis=' + !!window.speechSynthesis]);
+  setInterval(() => {
+    if (!buf.length) return;
+    fetch('/api/debug-log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(buf.splice(0)) })
+      .catch(() => {});
+  }, 1000);
+}
+
 // ---------- 身份 ----------
 
 function makeUuid() {
@@ -1077,6 +1095,7 @@ async function initMic() {
     micState = 'ready';
     console.log('[mic] ready, context sampleRate=' + audioCtx.sampleRate + ' state=' + audioCtx.state);
     if (pressing) startRecording();
+    else teardownMic(); // 授权期间已经松手：不留着麦克风，保持 playback
   } catch (e) {
     console.log('[mic] init failed', e);
     addNotice('Microphone unavailable: ' + (e && e.message ? e.message : e));
@@ -1097,6 +1116,15 @@ function teardownMic() {
   micSource = null;
   micNode = null;
   micState = 'off';
+  try {
+    if (navigator.audioSession) {
+      navigator.audioSession.type = 'playback';
+      console.log('[mic] released, audioSession.type=playback');
+    }
+  } catch (e) {
+    console.log('[mic] audioSession not settable', e);
+  }
+  updateTalkButton();
 }
 
 function startRecording() {
@@ -1139,6 +1167,10 @@ function finishRecording() {
   const s = recStats;
   setTimeout(() => {
     sendJson({ type: 'listen', mode: 'manual', state: 'stop' });
+    // 半双工：录完立即释放麦克风。iOS 在 play-and-record 下 TTS 走听筒或被静音键静音，
+    // 且麦克风开着时播过 speechSynthesis，同一条 track 之后只会采到静音。
+    // 下次按下时重新 getUserMedia（同一页面内不会再弹授权）
+    teardownMic();
     console.log('[mic] recording done: frames=' + s.frames + ' audio=' + (s.frames * 0.06).toFixed(2) + 's bytes=' + s.bytes +
       ' peak=' + s.peak.toFixed(3) + ' held=' + ((performance.now() - s.t0) / 1000).toFixed(2) + 's');
     if (s.frames < MIN_FRAMES) addNotice('Too short — hold the button while you speak');

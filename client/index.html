@@ -107,6 +107,13 @@
       border-radius: 8px;
     }
     #voiceLabel:empty { display: none; }
+    /* 透明的原生下拉框盖在声音标签上：点标签即选声音（iOS 弹系统选择器） */
+    #voiceWrap { position: relative; display: flex; min-width: 0; }
+    #voiceSelect {
+      position: absolute; inset: 0; width: 100%; height: 100%;
+      opacity: 0; font-size: 16px; border: 0; cursor: pointer;
+    }
+    #voiceLabel:empty + #voiceSelect { display: none; }
     #reconnectBtn {
       font-size: 14px;
       padding: 4px 10px;
@@ -413,7 +420,7 @@
       <div class="subline">
         <span id="statusDot"></span>
         <span id="statusText">Disconnected</span>
-        <span id="voiceLabel"></span>
+        <span id="voiceWrap"><span id="voiceLabel"></span><select id="voiceSelect" aria-label="Joe's voice"></select></span>
       </div>
     </div>
     <button id="reconnectBtn" type="button" hidden>Reconnect</button>
